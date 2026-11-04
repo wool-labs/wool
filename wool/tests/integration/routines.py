@@ -25,6 +25,7 @@ from tests.helpers import await_new_task
 from tests.helpers import cancelling_peer
 from tests.helpers import park_then_plant
 from tests.helpers import plant
+from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.worker.auth import current_credentials
 from wool.runtime.worker.connection import channel_pool_stats
 
@@ -624,12 +625,45 @@ async def nested_gen(n: int):
 
 
 @wool.routine
+async def nested_cancellable_sleep(sentinel_path: str, duration: float = 30.0):
+    """Coroutine that dispatches `cancellable_sleep`, nesting the sleep.
+
+    Nested counterpart of `cancellable_sleep`: the outer routine
+    runs on one worker and dispatches the sleep through that worker's
+    own proxy, so a nested proxy and its outbound channel are live on
+    the worker loop for as long as the inner sleep is suspended. Lets a
+    test land a shutdown on a worker whose loop is holding pooled
+    resources it must still clear.
+
+    :param sentinel_path:
+        Filesystem path the inner routine writes its termination reason
+        to — see `cancellable_sleep`.
+    :param duration:
+        Sleep duration in seconds, forwarded to the inner routine.
+    """
+    return await cancellable_sleep(sentinel_path, duration)
+
+
+@wool.routine
 async def get_pid() -> int:
     """Coroutine that returns the worker process id.
 
     Used to observe which worker process executed a dispatch.
     """
     return os.getpid()
+
+
+@wool.routine
+async def worker_channel_pool_stats() -> ResourcePool.Stats:
+    """Report the worker task loop's gRPC channel pool counters.
+
+    Reads the pool's `ResourcePool.Stats` on the loop that runs the
+    worker's tasks, which is the loop a nested dispatch caches its
+    channel on. Lets a caller observe what a worker's own outbound
+    channels leave behind — the counters are otherwise invisible from
+    outside the worker process.
+    """
+    return channel_pool_stats()
 
 
 @wool.routine

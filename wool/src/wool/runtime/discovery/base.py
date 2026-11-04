@@ -112,9 +112,17 @@ class DiscoverySubscriberLike(Protocol):
     Implementations must provide an async iterator that yields
     discovery events as workers join, leave, or update their status.
 
-    Subscriber instances ride `WorkerProxy`'s reduction when routines
-    dispatch nested routines, so they must be picklable; see the
-    caution on `WorkerProxy` about pre-called context managers.
+    A subscriber travels inside `WorkerProxy`'s reduction when a routine
+    dispatches a nested routine, so it must pickle to the configuration
+    it is built from (e.g., a namespace and options) and hold no live
+    handle; unpickling rebuilds an equivalent subscriber.
+    `~wool.runtime.discovery.pool.SubscriberMeta` provides such a
+    reduction.
+
+    The runtime iterates a subscriber and never enters it. Whatever owns
+    the lifetime of a subscriber that is a context manager enters it and
+    passes on the entered object. Reducing a `WorkerProxy` that holds a
+    context-manager subscriber raises `TypeError`.
     """
 
     def __aiter__(self) -> AsyncIterator[DiscoveryEvent]:
@@ -148,9 +156,9 @@ class DiscoveryLike(Protocol):
 
     A discovery backend pairs a publisher, i.e., how workers announce
     themselves, with subscribers, i.e., how peers learn about workers.
-    The forms in which a discovery protocol may be supplied are documented
-    by `WorkerPool`'s ``discovery`` parameter; the resolved object must
-    satisfy this protocol.
+    `WorkerPool`'s ``discovery`` parameter documents the forms a
+    discovery protocol may take and which protocol the resolved object
+    must satisfy.
 
     See `Discovery` for a convenience abstract base class.
     """

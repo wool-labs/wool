@@ -13,7 +13,9 @@ Workers are the execution layer where `@wool.routine` calls actually run. Each w
 | Durable | omitted | set | No workers spawned; connects to existing workers via discovery. |
 | Hybrid | set | set | Spawns local workers and discovers remote workers through the same protocol. |
 
-Which mode a call resolves to follows from two questions; what the pool then passes the factory follows from two more, answered by inspecting the factory's signature rather than by which overload matched:
+With `LocalDiscovery`, a Durable pool borrows a namespace through `LocalDiscovery.Subscriber`, and a Hybrid pool owns its namespace; see [Worker discovery](../discovery/README.md#usage-examples).
+
+Which mode a call resolves to follows from two questions; what the pool then passes the factory follows from two more, answered by inspecting the factory's signature:
 
 ```mermaid
 flowchart TD
@@ -38,7 +40,7 @@ flowchart TD
     named -- no --> unused["the factory owns the identity<br/>a configured value is unused and warns"]
 ```
 
-Both signature questions are orthogonal to the mode and to each other — the four combinations are the four shapes `WorkerFactoryLike` admits; see [Custom workers](#custom-workers). `worker` takes the same alias whatever the spawning mode — Durable declares no `worker` at all — so the deprecated `size` overloads mirror the `spawn` ones exactly.
+Both signature questions are orthogonal to the mode and to each other — the four combinations are the four shapes `WorkerFactoryLike` admits; see [Custom workers](#custom-workers).
 
 **Default** — no arguments needed:
 
@@ -206,7 +208,7 @@ async with wool.WorkerPool(
 Each worker subprocess has a two-loop architecture:
 
 - The **gRPC event loop** runs the gRPC server (`WorkerService`). It receives dispatch RPCs, sends acknowledgments, and streams results back.
-- A dedicated **worker event loop** runs on a daemon thread. Routines are scheduled here so that long-running work never blocks gRPC operations. The pools a routine draws on — the proxy pool and the discovery-subscriber pool — are bound to this loop and are finalized on it when the loop retires; a `ResourcePool` serves one running loop at a time.
+- A dedicated **worker event loop** runs on a daemon thread. Routines are scheduled here so that long-running work never blocks gRPC operations. The pools a routine draws on — its proxies, its discovery subscribers, and the gRPC channels a nested dispatch opens — keep their entries for this loop in a partition of their own (see `ResourcePool`) and are finalized on it when it retires; see `WorkerService` for the teardown order.
 
 Per-dispatch, the gRPC handler instantiates a `DispatchSession` — an async context manager and async iterator that owns the dispatch's full worker-side lifecycle as a uniform driver for both coroutine and async-generator Wool routines. The session has four phases:
 
@@ -264,9 +266,11 @@ The `stop` RPC accepts a `timeout` argument that controls how in-flight tasks ar
 
 Signal handlers map `SIGTERM` to timeout 0 (cancel immediately) and `SIGINT` to timeout -1 (wait indefinitely).
 
+The same value also governs the worker-thread join when a stop retires the loop; see `WorkerService.stop` for the mapping. If idle retirement has already started, stop's join waits for that retirement's finite bound instead (i.e., the drain budget plus one per-clear floor for every pool the retirement clears, at most ~6.5 s with the defaults), regardless of the request timeout, and can return while the retiring daemon thread is still running. The budgets that bound a retirement, and the idle TTL that arms one, are `WorkerService` constructor parameters — `drain_timeout`, `min_clear_timeout` and `worker_loop_ttl`; see `WorkerService` for each one's meaning and default.
+
 ### Nested routines
 
-Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a worker-sentinel task (a background coroutine that keeps the proxy's connection context alive), and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. The proxy pool is bound to the worker event loop that dispatches through it, so proxies are also finalized when that loop retires after its own idle TTL; a proxy is reused only while the interval between dispatches is shorter than both. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead.
+Worker subprocesses can dispatch tasks to other workers. Each subprocess is configured with a `ResourcePool` of `WorkerProxy` instances (via `wool.__proxy_pool__`), so `@wool.routine` calls within a task transparently route to the target pool. Spinning up a `WorkerProxy` is not free — it involves establishing a discovery subscription, starting a worker-sentinel task (a background coroutine that keeps the proxy's connection context alive), and opening gRPC connections — so the resource pool caches proxies with a configurable TTL (default 60 seconds, set via `proxy_pool_ttl` on `LocalWorker`). If the interval between dispatches for a given pool on a given worker is shorter than the TTL, the cached proxy is reused. If it exceeds the TTL, the proxy is finalized and must be recreated on the next dispatch. The proxy pool's entries for the worker event loop are finalized when that loop retires after its own idle TTL; a proxy is reused only while the interval between dispatches is shorter than both. Tuning `proxy_pool_ttl` above the expected dispatch interval keeps proxies warm and avoids this cold-start overhead. Retiring the last cached proxy also releases the worker loop's hold on the channel pool, so the loop's gRPC channels are retired with it — see [Connection pooling](#connection-pooling).
 
 Proxies on worker subprocesses are lazy by default — the `WorkerPool` propagates its `lazy` flag to every `WorkerProxy` it constructs, and each task serializes the proxy (including the flag) so that workers receiving the task inherit the same laziness setting. A lazy proxy defers discovery subscription and worker-sentinel task setup until its first `dispatch()` call, so workers that never invoke nested routines pay no startup cost.
 
@@ -297,24 +301,24 @@ Because the fast path is out of reach on macOS, treat the forking path as the on
 
 | Mode | Parameter | Description |
 | ---- | --------- | ----------- |
-| Pool URI | `pool_uri` | Subscribes to `LocalDiscovery` with the URI as namespace and tag filter. |
-| Discovery | `discovery` | Accepts any `DiscoverySubscriberLike` or `Factory` thereof. |
+| Pool URI | `pool_uri` | Borrows the `LocalDiscovery` namespace named by the URI, admitting workers tagged with the URI or any of `tags`. |
+| Discovery | `discovery` | Takes a `DiscoverySubscriberLike`; see `WorkerProxy`. |
 | Static | `workers` | Takes a sequence of `WorkerMetadata` directly — no discovery needed. |
 
 ### Lazy startup
 
-`WorkerProxy` accepts a `lazy` parameter (default `True`) that controls when the proxy actually starts — i.e., when it subscribes to discovery, launches the worker sentinel task, and initializes the load balancer context.
+`WorkerProxy` accepts a `lazy` parameter (default `True`) that controls when the proxy actually starts, i.e., when it acquires the resources it dispatches through — the channel-pool hold, the load-balancer context, the discovery subscription, and the worker sentinel — see `WorkerProxy.start`.
 
 | `lazy` | `enter()` / `__aenter__` | `dispatch()` | `exit()` on un-started proxy |
 | ------ | ------------------------ | ------------- | ----------------------------- |
-| `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches | No-op (safe to call) |
+| `True` | Sets context var only | Calls `start()` on first call (retrying on a later call if it failed), then dispatches; raises `RuntimeError` once the proxy has been stopped | No-op (safe to call) |
 | `False` | Sets context var, calls `start()` | Raises `RuntimeError` if not started | Raises `RuntimeError` |
 
-When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag is preserved through `cloudpickle` serialization, so proxies sent to worker subprocesses as part of a task retain their laziness setting.
+When `lazy=True`, concurrent `dispatch()` calls use a double-checked lock to ensure the proxy starts exactly once. The `lazy` flag rides the proxy's reduction through Wool's serializer (see `WorkerProxy.__wool_reduce__`), so proxies sent to worker subprocesses as part of a task retain their laziness setting.
 
 ### Context lifecycle
 
-Both `WorkerPool` and `WorkerProxy` are **single-use** async context managers. Once entered and exited, the same instance cannot be entered again — create a new instance instead. Attempting to call `enter()` or `__aenter__()` a second time raises `RuntimeError`. This prevents silent state corruption from reentrant or repeated context usage (e.g., accidentally nesting `async with proxy:` blocks or calling `enter()` in a retry loop).
+Both `WorkerPool` and `WorkerProxy` are **single-use** async context managers. Once entered and exited, the same instance cannot be entered again — create a new instance instead. Attempting to call `enter()` or `__aenter__()` a second time raises `RuntimeError`. This prevents silent state corruption from reentrant or repeated context usage (e.g., accidentally nesting `async with proxy:` blocks or calling `enter()` in a retry loop). `start()` and `stop()` are likewise single-use: a proxy is started once and stopped once, and a stopped proxy cannot be restarted or dispatched through — see `WorkerProxy` for the states and the error each rejected call carries.
 
 ```python
 # Correct — one instance per context
@@ -332,7 +336,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 ### Connection pooling
 
-`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second TTL — idle channels are finalized after the TTL expires. The pool serves one running event loop at a time: a process that runs successive loops gets a fresh channel set per loop, channels left by a loop that is no longer running are dropped without being closed, and using the pool from two running loops at once raises. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore is sized by the worker's advertised `max_concurrent_streams` — the client-side dispatch gate. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
+`WorkerConnection` is a lightweight facade that dispatches tasks over pooled gRPC channels. Channels are cached at the module level in a `ResourcePool` keyed by `(target, credentials, options, peer)`, with a 60-second idle TTL, i.e., a channel no dispatch still references is finalized 60 seconds after its last reference drops. The pool is partitioned by event loop: every running loop, concurrent or successive, caches its own channel set, and a channel is only ever used and closed on the loop that opened it. A `WorkerConnection` used as an async context manager closes on exit, retiring its own keys drain-first; each `WorkerProxy` holds the pool for its started lifetime and closes the connections of workers that depart it — see `WorkerProxy` for the contract, `channel_pool_hold` for the hold, and `ResourcePool` for what a closed loop's leftovers become. Keying on the `WorkerCredentials` value (a frozen dataclass, so hashable and value-equal) is what makes rotation observable at the channel layer — see [Credential providers: admission and rotation](#credential-providers-admission-and-rotation). Each channel's concurrency semaphore — the client-side dispatch gate — is sized by the worker's advertised `max_concurrent_streams`. The worker's own HTTP/2 `MAX_CONCURRENT_STREAMS` ceiling is set to twice that value to absorb transient permit-turnover overshoot without faulting the connection. See issue #290.
 
 ### Idle reporting
 
@@ -340,7 +344,7 @@ Workers are self-describing: each worker advertises its gRPC transport configura
 
 Idle is measured as the time since the worker's in-flight task set last emptied, with worker startup counting as the initial empty state. It reads `0.0` while any task is in flight and restarts from zero each time the set drains again, so the value answers "how long has this worker had nothing to do", not "how long since it was started". The measurement is taken on a monotonic clock, so a wall-clock adjustment cannot distort it. Polling creates no `DispatchSession` and never enters the in-flight set, so reading the measurement cannot disturb it.
 
-This is worker idleness, not channel idleness: the 60-second `ResourcePool` TTL above and `WorkerOptions.max_connection_idle_ms` govern how long an unused *channel* survives within the loop that opened it, and neither is affected by whether the worker at the other end is executing tasks.
+This is worker idleness, not channel idleness: the channel-lifetime rules in [Connection pooling](#connection-pooling) and the `max_connection_idle_ms` limit below govern how long an unused *channel* survives within the loop that opened it, and none of them is affected by whether the worker at the other end is executing tasks.
 
 A worker that predates the idle capability answers the RPC with gRPC `UNIMPLEMENTED`, which surfaces as `IdleUnavailable`. It descends from `WoolError` rather than `RpcError`, so `except RpcError` does not catch it — an absent capability is not an RPC-health fault, and a polling client should treat it as "idle reporting is unavailable on this worker" rather than as a transient hiccup or an unhealthy peer. Every other gRPC failure classifies as it does for dispatch: transient codes raise `TransientRpcError`, everything else raises `RpcError`.
 
@@ -370,7 +374,9 @@ options = WorkerOptions(
 async with wool.WorkerPool(
     spawn=4,
     worker=lambda *tags, credentials=None: LocalWorker(
-        *tags, credentials=credentials, options=options,
+        *tags,
+        credentials=credentials,
+        options=options,
     ),
 ):
     result = await my_routine()
@@ -492,7 +498,7 @@ provider = credentials.as_provider(peers=lambda name: name.endswith(".wool.svc")
 
 The unconfigured admission state is the upgrade path for a fleet that does not yet advertise: roll the workers out with `identity` set first, since a client that configures no `peers` ignores the advertisement, then configure `peers` on the clients once the fleet carries names.
 
-**The advertisement selects which name is verified; it never widens what is accepted.** A worker claiming a name it holds no certificate for passes the admission gate and then fails the handshake. Security therefore does not depend on the discovery plane being trustworthy — only availability does, since forged advertisements cost connection attempts that go nowhere. A deployment wanting to remove even that cost should authenticate its discovery backend; wool's built-in LAN and shared-memory backends do not.
+**The advertisement selects which name is verified; it never widens what is accepted.** A worker claiming a name it holds no certificate for passes the admission gate and then fails the handshake. Security therefore does not depend on the discovery plane being trustworthy — only availability does, since forged advertisements cost connection attempts that go nowhere. A deployment wanting to remove even that cost should authenticate its discovery backend; wool's built-in LAN and local file backends do not.
 
 See `WorkerCredentialsProvider`'s `peers` parameter for the direction the policy governs.
 
@@ -502,4 +508,4 @@ For nested routines that dispatch back to the worker's own address, the worker e
 
 ### Discovery-plane trust
 
-Peer-verified mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` over whatever discovery mechanism is in use (LAN multicast, shared-memory, a custom `DiscoveryLike`), none of which is authenticated, so every claim in that record is forgeable by anything that can write to that plane — its `identity` among them. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate carrying the name it advertised, which is the name the connection verifies against. The discovery plane is not authenticated; treat discovery as an untrusted hint and the handshake as the trust boundary.
+Peer-verified mTLS secures the **dispatch** plane; it does not authenticate the **discovery** plane. A worker self-advertises its `WorkerMetadata` over whatever discovery mechanism is in use (LAN multicast, local files, a custom `DiscoveryLike`), none of which is authenticated, so every claim in that record is forgeable by anything that can write to that plane — its `identity` among them. The proxy-side security filter that drops workers whose advertised `secure` flag disagrees with the client's credential posture is therefore a **compatibility gate, not a trust boundary**: it prevents a plaintext/encrypted mismatch, not a malicious advertisement. Actual confidentiality and integrity rest entirely on the mTLS handshake performed when a connection is made — a forged advertisement still cannot complete the handshake without a CA-trusted certificate carrying the name it advertised, which is the name the connection verifies against. The discovery plane is not authenticated; treat discovery as an untrusted hint and the handshake as the trust boundary.

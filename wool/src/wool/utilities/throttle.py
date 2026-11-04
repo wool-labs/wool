@@ -47,7 +47,7 @@ class Throttle:
         cannot be mistaken for a suppressed one.
 
         :param key:
-            What the condition is about, e.g. the worker it concerns.
+            What the condition is about, e.g., the worker it concerns.
             Defaults to ``None``, the single slot a caller tracking one
             global condition wants.
         :param detail:

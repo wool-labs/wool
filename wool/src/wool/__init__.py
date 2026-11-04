@@ -30,6 +30,9 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceContended
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
 from wool.runtime.discovery.lan import AdvertiseHostError
 from wool.runtime.discovery.lan import LanDiscovery
@@ -41,6 +44,7 @@ from wool.runtime.loadbalancer.base import LoadBalancerContextView
 from wool.runtime.loadbalancer.base import LoadBalancerLike
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.resourcepool import Resource
 from wool.runtime.resourcepool import ResourcePool
 from wool.runtime.routine.task import Task
 from wool.runtime.routine.task import TaskException
@@ -131,6 +135,9 @@ __all__ = [
     "DiscoveryEvent",
     "DiscoveryEventType",
     "DiscoveryLike",
+    "DiscoveryNamespaceContended",
+    "DiscoveryNamespaceInUse",
+    "DiscoveryNamespaceNotFound",
     "DiscoveryPublisherLike",
     "DiscoverySubscriberLike",
     "DiscoveryWorkerNotFound",
@@ -154,6 +161,8 @@ __all__ = [
     "NoWorkersAvailable",
     "PredicateFunction",
     "Refreshing",
+    "Resource",
+    "ResourcePool",
     "RoundRobinLoadBalancer",
     "RpcError",
     "RuntimeContext",

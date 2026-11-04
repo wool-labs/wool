@@ -20,17 +20,28 @@ from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.process import WorkerProcess
+from wool.runtime.worker.service import _DRAIN_TIMEOUT
+from wool.runtime.worker.service import _MIN_CLEAR_TIMEOUT
 
 if TYPE_CHECKING:
     from wool.runtime.worker.service import BackpressureLike
 
-_STOP_RPC_MARGIN: Final[float] = 5.0
-"""Seconds added to a finite stop timeout to form the graceful stop
-RPC's deadline. The worker drains in-flight tasks for up to the full
-stop timeout before responding, so the deadline must exceed it; the
-margin covers transport and response overhead. Without a deadline, a
-wedged worker would hang ``stop()`` forever and the force-terminate
-fallback would never be reached."""
+STOP_RPC_MARGIN: Final[float] = _DRAIN_TIMEOUT + 3 * _MIN_CLEAR_TIMEOUT + 1.0
+"""Seconds added beyond twice a finite stop timeout to form the graceful
+stop RPC's deadline. ``StopRequest.timeout`` bounds two sequential waits
+on the worker (i.e., the in-flight drain and the worker-thread join), so
+the deadline budgets the stop timeout twice. A stop that lands while an
+idle retirement is in flight instead waits out that retirement's bound,
+which `WorkerService._destroy_worker_loop` owns; this margin covers it
+at the worker's three pools (proxy, subscriber, channel), i.e., a clear
+floor each on top of the drain budget, plus one second of transport
+and response overhead. The margin is sized from the module defaults as
+they stand at import, so rebinding one afterwards does not resize it;
+the spawned `WorkerProcess`'s service always runs with those defaults.
+Without a deadline, a wedged worker would hang ``stop()`` forever
+and the force-terminate fallback would never be reached. The name is
+un-prefixed because other modules in this package reference it; it is
+package-internal rather than part of wool's supported public API."""
 
 
 # public
@@ -47,7 +58,12 @@ class LocalWorker(Worker):
     :param port:
         Port to bind. 0 for random available port.
     :param shutdown_grace_period:
-        Graceful shutdown timeout in seconds.
+        Graceful shutdown timeout in seconds, forwarded as the
+        stop request's timeout. The worker budgets it twice over
+        during a stop, once for the in-flight drain and once for the
+        worker-thread join, so the stop RPC's deadline is derived
+        from it rather than equal to it — see the worker README's
+        "Shutdown timeout" section.
     :param proxy_pool_ttl:
         Proxy pool TTL in seconds.
     :param credentials:
@@ -184,7 +200,7 @@ class LocalWorker(Worker):
         """Stop the worker process gracefully, then reap it.
 
         Sends the worker a stop RPC bounded by a deadline derived from
-        ``grace`` (see `_STOP_RPC_MARGIN`), then — however the RPC
+        ``grace`` (see `STOP_RPC_MARGIN`), then — however the RPC
         fared — reaps the subprocess — see `WorkerProcess.reap` for the
         escalation. The reap runs in an executor thread so it
         completes even when this coroutine is cancelled; only a second
@@ -204,10 +220,11 @@ class LocalWorker(Worker):
             if self._worker_process.is_alive():
                 assert self.address
 
-                # Route the stop RPC through WorkerConnection; ``close``
-                # releases the pooled channel this stop acquired. The
-                # provider rides along so the connection resolves
-                # current credential material per call.
+                # Route the stop RPC through `WorkerConnection` so the
+                # stop's channel is retired on exit — see
+                # `WorkerConnection.close`. The provider rides along so
+                # the connection resolves current credential material
+                # per call.
                 # Pin the worker's own identity — nothing else here
                 # supplies a name — see `WorkerProxy` for why. A worker
                 # declaring none keeps the dialed-address fallback,
@@ -221,19 +238,17 @@ class LocalWorker(Worker):
                         peer=self._identity,
                     )
                 )
-                try:
+                async with connection:
                     # Only a bounded drain (positive grace) admits a
                     # finite deadline; a negative grace drains
                     # indefinitely, and ``None`` keeps the pre-existing
-                    # unbounded call. See `_STOP_RPC_MARGIN` for the
-                    # finite deadline.
+                    # unbounded call. The grace is budgeted twice — see
+                    # `STOP_RPC_MARGIN`.
                     if grace is None or grace < 0:
                         deadline = None
                     else:
-                        deadline = grace + _STOP_RPC_MARGIN
+                        deadline = 2 * grace + STOP_RPC_MARGIN
                     await connection.stop(grace=grace, timeout=deadline)
-                finally:
-                    await connection.close()
         finally:
             # `reap` blocks on `join`, so it must run off-loop — see
             # the docstring for the cancellation contract. A negative

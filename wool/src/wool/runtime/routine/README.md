@@ -45,46 +45,6 @@ Instance, class, and static methods are all supported. Decorator order does not 
 
 Tasks are serialized to protobuf for gRPC transmission (`to_protobuf` / `from_protobuf`) using `cloudpickle` for the callable and its arguments.
 
-## Task lifecycle events
-
-Wool provides task lifecycle hooks in the form of events that can be intercepted with event handlers. Handlers are executed on a dedicated thread to avoid blocking the main event loop. `TaskEvent` is an `Event` subclass that carries a reference to the associated `Task`. Register handlers with the decorator:
-
-```python
-@wool.TaskEvent.handler("task-created", "task-completed")
-def on_task(event: wool.TaskEvent, timestamp: int, context=None) -> None:
-    ...
-```
-
-`TaskEventType` defines the valid event type literals:
-
-| Event type                    | When emitted                                               |
-| ----------------------------- | ---------------------------------------------------------- |
-| `task-created`                | Task dataclass is instantiated.                            |
-| `task-scheduled`              | Worker service begins executing the task.                  |
-| `task-started`                | Asyncio handle enters the task's context.                  |
-| `task-stopped`                | Asyncio handle exits the task's context.                   |
-| `task-completed`              | Asyncio task finishes (success or failure).                |
-| `task-iteration-initiated`    | Client is about to write an iteration request to the gRPC stream.  |
-| `task-iteration-started`      | Server forwards the iteration command to the worker loop.  |
-| `task-iteration-completed`    | Server receives the iteration result from the worker loop. |
-
-`TaskEventHandler` is the protocol for handler callables.
-
-### Iteration events
-
-The three `task-iteration-*` event types track individual iterations of a streaming (async generator) dispatch. They are carried by `IterationEvent`, a `TaskEvent` subclass with two additional fields:
-
-- **kind** (`IterationEventKind`) — the operation that drove the iteration: `"next"`, `"send"`, or `"throw"`.
-- **step** (`int`) — zero-based iteration index within the stream.
-
-Together, the three event types enable two latency measurements per iteration: network dispatch latency (`initiated` → `started`) and worker execution latency (`started` → `completed`).
-
-```python
-@wool.IterationEvent.handler("task-iteration-started", "task-iteration-completed")
-def on_iteration(event: wool.IterationEvent, timestamp: int, context=None) -> None:
-    print(f"[{event.type}] step={event.step} kind={event.kind}")
-```
-
 ## Task exceptions
 
 When a task raises during execution, the exception is captured as a `TaskException` dataclass with two fields:

@@ -1,0 +1,595 @@
+import pickle
+import threading
+import uuid
+
+import pytest
+from hypothesis import example
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
+
+import wool
+from wool.runtime.context.exceptions import SerializationWarning
+from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
+from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceContended
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
+from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
+from wool.runtime.worker.frame import ExceptionResponseFrame
+from wool.runtime.worker.frame import Frame
+
+#: Every discovery exception, the arguments its fields are built from,
+#: and the names those fields carry. Drives the contracts in
+#: `TestDiscoveryExceptionReconstruction` that hold across every class;
+#: each class's own property coverage lives in its own suite.
+_RECONSTRUCTION_CASES = [
+    pytest.param(DiscoveryCapacityExhausted, (128,), ("capacity",), id="capacity"),
+    pytest.param(DiscoveryBlockExhausted, (2048,), ("size",), id="block"),
+    pytest.param(
+        DiscoveryWorkerNotFound, (uuid.UUID(int=7),), ("uid",), id="worker-not-found"
+    ),
+    pytest.param(DiscoveryNamespaceInUse, ("ns",), ("namespace",), id="in-use"),
+    pytest.param(DiscoveryNamespaceContended, ("ns",), ("namespace",), id="contended"),
+    pytest.param(DiscoveryNamespaceNotFound, ("ns",), ("namespace",), id="not-found"),
+]
+
+
+def _marshalled(error):
+    """Round-trip error through a worker's exception response frame.
+
+    Returns the decoded payload. The exception crosses the same
+    serializer a real dispatch uses.
+    """
+    frame = ExceptionResponseFrame.for_send(error, wire_chain_manifest=None)
+    return Frame.from_protobuf(frame.to_protobuf()).payload
+
+
+class TestDiscoveryCapacityExhausted:
+    @given(capacity=st.integers())
+    @example(capacity=128)
+    @example(capacity=None)
+    @settings(max_examples=100)
+    def test___init___should_expose_its_capacity_across_the_argument_domain(
+        self, capacity
+    ):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any capacity.
+        When:
+            A DiscoveryCapacityExhausted is constructed from it.
+        Then:
+            It should expose the capacity unchanged and name it in the
+            message, omitting the clause entirely where it is None.
+        """
+        # Act
+        error = DiscoveryCapacityExhausted(capacity)
+
+        # Assert
+        assert error.capacity == capacity
+
+        message = str(error)
+        assert message == (
+            f"No available slots in discovery registry (capacity {capacity})"
+        )
+
+    @given(capacity=st.integers())
+    @settings(max_examples=50)
+    def test___reduce___should_preserve_its_capacity_across_a_boundary(self, capacity):
+        """Test reconstruction survives pickling.
+
+        Given:
+            Any capacity.
+        When:
+            A DiscoveryCapacityExhausted is pickled and unpickled.
+        Then:
+            It should restore the capacity and its args.
+        """
+        # Arrange
+        error = DiscoveryCapacityExhausted(capacity)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(error))
+
+        # Assert
+        assert restored.capacity == capacity
+        assert restored.args == error.args
+
+    @given(capacity=st.integers())
+    @settings(max_examples=25)
+    def test___init___should_survive_the_worker_exception_serializer(self, capacity):
+        """Test the exception survives the worker exception serializer.
+
+        Given:
+            Any capacity.
+        When:
+            A DiscoveryCapacityExhausted is encoded in an exception
+            response frame and decoded.
+        Then:
+            It should arrive as the same class with its capacity and the
+            same message.
+        """
+        # Arrange
+        error = DiscoveryCapacityExhausted(capacity)
+
+        # Act
+        restored = _marshalled(error)
+
+        # Assert
+        assert isinstance(restored, DiscoveryCapacityExhausted)
+        assert restored.capacity == capacity
+        assert str(restored) == str(error)
+
+
+class TestDiscoveryBlockExhausted:
+    @given(size=st.integers())
+    @example(size=2048)
+    @example(size=None)
+    @settings(max_examples=100)
+    def test___init___should_expose_its_size_across_the_argument_domain(self, size):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any optional payload size.
+        When:
+            A DiscoveryBlockExhausted is constructed from it.
+        Then:
+            It should expose the size unchanged and name it in the
+            message, omitting the clause entirely where it is None.
+        """
+        # Act
+        error = DiscoveryBlockExhausted(size)
+
+        # Assert
+        assert error.size == size
+
+        message = str(error)
+        assert message == f"Worker metadata exceeds its registered block ({size} bytes)"
+
+    @given(size=st.integers())
+    @settings(max_examples=50)
+    def test___reduce___should_preserve_its_size_across_a_boundary(self, size):
+        """Test reconstruction survives pickling.
+
+        Given:
+            Any optional payload size.
+        When:
+            A DiscoveryBlockExhausted is pickled and unpickled.
+        Then:
+            It should restore the size and its args.
+        """
+        # Arrange
+        error = DiscoveryBlockExhausted(size)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(error))
+
+        # Assert
+        assert restored.size == size
+        assert restored.args == error.args
+
+    @given(size=st.integers())
+    @settings(max_examples=25)
+    def test___init___should_survive_the_worker_exception_serializer(self, size):
+        """Test the exception survives the worker exception serializer.
+
+        Given:
+            Any optional payload size.
+        When:
+            A DiscoveryBlockExhausted is encoded in an exception
+            response frame and decoded.
+        Then:
+            It should arrive as the same class with its size and the
+            same message.
+        """
+        # Arrange
+        error = DiscoveryBlockExhausted(size)
+
+        # Act
+        restored = _marshalled(error)
+
+        # Assert
+        assert isinstance(restored, DiscoveryBlockExhausted)
+        assert restored.size == size
+        assert str(restored) == str(error)
+
+
+class TestDiscoveryWorkerNotFound:
+    @given(uid=st.uuids())
+    @example(uid=uuid.UUID(int=7))
+    @example(uid=None)
+    @settings(max_examples=100)
+    def test___init___should_expose_its_uid_across_the_argument_domain(self, uid):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any optional worker UID.
+        When:
+            A DiscoveryWorkerNotFound is constructed from it.
+        Then:
+            It should expose the UID unchanged and name it in the
+            message, omitting the clause entirely where it is None.
+        """
+        # Act
+        error = DiscoveryWorkerNotFound(uid)
+
+        # Assert
+        assert error.uid == uid
+
+        message = str(error)
+        assert message == f"Worker {uid} not found in discovery registry"
+
+    @given(uid=st.uuids())
+    @settings(max_examples=50)
+    def test___reduce___should_preserve_its_uid_across_a_boundary(self, uid):
+        """Test reconstruction survives pickling.
+
+        Given:
+            Any optional worker UID.
+        When:
+            A DiscoveryWorkerNotFound is pickled and unpickled.
+        Then:
+            It should restore the UID as a UUID and its args.
+        """
+        # Arrange
+        error = DiscoveryWorkerNotFound(uid)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(error))
+
+        # Assert
+        assert restored.uid == uid
+        assert restored.args == error.args
+
+    @given(uid=st.uuids())
+    @settings(max_examples=25)
+    def test___init___should_survive_the_worker_exception_serializer(self, uid):
+        """Test the exception survives the worker exception serializer.
+
+        Given:
+            Any optional worker UID.
+        When:
+            A DiscoveryWorkerNotFound is encoded in an exception
+            response frame and decoded.
+        Then:
+            It should arrive as the same class with its UID and the same
+            message.
+        """
+        # Arrange
+        error = DiscoveryWorkerNotFound(uid)
+
+        # Act
+        restored = _marshalled(error)
+
+        # Assert
+        assert isinstance(restored, DiscoveryWorkerNotFound)
+        assert restored.uid == uid
+        assert str(restored) == str(error)
+
+
+class TestDiscoveryNamespaceInUse:
+    @given(namespace=st.text())
+    @settings(max_examples=100)
+    def test___init___should_expose_its_namespace_across_the_argument_domain(
+        self, namespace
+    ):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceInUse is constructed from it.
+        Then:
+            It should expose the namespace unchanged, carry it as its
+            sole argument, and render exactly the message quoting it,
+            with no trailing clause and omitting the namespace entirely
+            where it is None.
+        """
+        # Act
+        error = DiscoveryNamespaceInUse(namespace)
+
+        # Assert
+        assert error.namespace == namespace
+        assert error.args == (namespace,)
+
+        # The whole message, not a substring: a namespace in use has a
+        # live owner, so there is nothing for an operator to go and
+        # remove and nothing a trailing clause could usefully say.
+        message = str(error)
+        assert message == f"Discovery namespace {namespace!r} is already in use"
+
+    def test___init___should_reject_a_segment_argument(self):
+        """Test the error offers no segment for a caller to read.
+
+        Given:
+            The single-argument constructor the namespace-in-use error
+            now exposes, a namespace being in use only while its owner
+            lives
+        When:
+            It is constructed with a second positional argument, and
+            again with a segment keyword
+        Then:
+            It should raise TypeError both times, and an instance built
+            from a namespace alone should expose no segment attribute —
+            there is no backing segment for a caller to read or an
+            operator to remove.
+        """
+        # Act & assert
+        with pytest.raises(TypeError):
+            DiscoveryNamespaceInUse("ns", "segment")
+        with pytest.raises(TypeError):
+            DiscoveryNamespaceInUse("ns", segment="segment")
+        assert not hasattr(DiscoveryNamespaceInUse("ns"), "segment")
+
+    @given(namespace=st.text())
+    @settings(max_examples=50)
+    def test___reduce___should_preserve_its_namespace_across_a_process_boundary(
+        self, namespace
+    ):
+        """Test reconstruction survives pickling.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceInUse is pickled and unpickled.
+        Then:
+            It should restore the namespace and carry it as its sole
+            argument on both sides of the boundary.
+        """
+        # Arrange
+        error = DiscoveryNamespaceInUse(namespace)
+        assert error.args == (namespace,)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(error))
+
+        # Assert — the shape, not merely whatever tuple the class built:
+        # comparing the two args tuples holds for any signature.
+        assert restored.namespace == namespace
+        assert restored.args == (namespace,)
+
+    @given(namespace=st.text())
+    @settings(max_examples=25)
+    def test___init___should_survive_the_worker_exception_serializer(self, namespace):
+        """Test the exception survives the worker exception serializer.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceInUse is encoded in an exception
+            response frame and decoded.
+        Then:
+            It should arrive as the same class with its namespace and
+            the same message.
+        """
+        # Arrange
+        error = DiscoveryNamespaceInUse(namespace)
+
+        # Act
+        restored = _marshalled(error)
+
+        # Assert
+        assert isinstance(restored, DiscoveryNamespaceInUse)
+        assert restored.namespace == namespace
+        assert str(restored) == str(error)
+
+
+class TestDiscoveryNamespaceContended:
+    @given(namespace=st.text())
+    @settings(max_examples=100)
+    def test___init___should_expose_its_namespace_across_the_argument_domain(
+        self, namespace
+    ):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceContended is constructed from it.
+        Then:
+            It should expose the namespace unchanged, carry it as its
+            sole argument, and render exactly the message quoting it,
+            naming the replacement that defeated the claim rather than
+            an owner holding it.
+        """
+        # Act
+        error = DiscoveryNamespaceContended(namespace)
+
+        # Assert
+        assert error.namespace == namespace
+        assert error.args == (namespace,)
+
+        # The whole message, not a substring: what separates this from
+        # DiscoveryNamespaceInUse is that nothing holds the claim, so
+        # the message must not read as though something does.
+        message = str(error)
+        assert message == (
+            f"Discovery namespace {namespace!r} was replaced faster than it "
+            "could be claimed"
+        )
+        assert "in use" not in message
+
+
+class TestDiscoveryNamespaceNotFound:
+    @given(namespace=st.text())
+    @settings(max_examples=100)
+    def test___init___should_expose_its_namespace_across_the_argument_domain(
+        self, namespace
+    ):
+        """Test field exposure and message content over the argument.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceNotFound is constructed from it.
+        Then:
+            It should expose the namespace unchanged and render
+            exactly the message quoting it.
+        """
+        # Act
+        error = DiscoveryNamespaceNotFound(namespace)
+
+        # Assert
+        assert error.namespace == namespace
+
+        # The whole message: a namespace whose owner is gone may still
+        # have a readable registry, and a successor may already hold
+        # one, so the claim is scoped to the binding rather than
+        # asserting anything about the namespace's own ownership.
+        message = str(error)
+        assert message == (
+            f"Discovery namespace {namespace!r} has no live owner for this binding"
+        )
+
+    @given(namespace=st.text())
+    @settings(max_examples=50)
+    def test___reduce___should_preserve_its_namespace_across_a_process_boundary(
+        self, namespace
+    ):
+        """Test reconstruction survives pickling.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceNotFound is pickled and unpickled.
+        Then:
+            It should restore the namespace and its args.
+        """
+        # Arrange
+        error = DiscoveryNamespaceNotFound(namespace)
+
+        # Act
+        restored = pickle.loads(pickle.dumps(error))
+
+        # Assert
+        assert restored.namespace == namespace
+        assert restored.args == error.args
+
+    @given(namespace=st.text())
+    @settings(max_examples=25)
+    def test___init___should_survive_the_worker_exception_serializer(self, namespace):
+        """Test the exception survives the worker exception serializer.
+
+        Given:
+            Any namespace.
+        When:
+            A DiscoveryNamespaceNotFound is encoded in an exception
+            response frame and decoded.
+        Then:
+            It should arrive as the same class with its namespace and
+            the same message.
+        """
+        # Arrange
+        error = DiscoveryNamespaceNotFound(namespace)
+
+        # Act
+        restored = _marshalled(error)
+
+        # Assert
+        assert isinstance(restored, DiscoveryNamespaceNotFound)
+        assert restored.namespace == namespace
+        assert str(restored) == str(error)
+
+
+class TestDiscoveryExceptionReconstruction:
+    """Contracts shared by every discovery exception."""
+
+    @pytest.mark.parametrize(
+        ("cls", "argument"),
+        [
+            (DiscoveryCapacityExhausted, 128),
+            (DiscoveryBlockExhausted, 2048),
+            (DiscoveryWorkerNotFound, uuid.UUID(int=7)),
+            (DiscoveryNamespaceInUse, "ns"),
+            (DiscoveryNamespaceContended, "ns"),
+            (DiscoveryNamespaceNotFound, "ns"),
+        ],
+        ids=lambda value: getattr(value, "__name__", None),
+    )
+    def test___init___should_subclass_wool_error_not_runtime_error(self, cls, argument):
+        """Test each discovery exception joins the Wool umbrella.
+
+        Given:
+            A discovery exception class.
+        When:
+            An instance is raised and caught as wool.WoolError.
+        Then:
+            It should be caught by that clause, be the very class
+            re-exported from wool, and not subclass RuntimeError.
+        """
+        # Arrange
+        raised = cls(argument)
+
+        # Act
+        try:
+            raise raised
+        except wool.WoolError as error:
+            caught = error
+
+        # Assert
+        assert caught is raised
+        assert getattr(wool, cls.__name__) is cls
+        assert not issubclass(cls, RuntimeError)
+
+    @pytest.mark.parametrize(("cls", "args", "fields"), _RECONSTRUCTION_CASES)
+    def test___init___should_reconstruct_from_args(self, cls, args, fields):
+        """Test every discovery exception rebuilds intact from its args.
+
+        Given:
+            A discovery exception constructed with its fields either
+            known or omitted.
+        When:
+            A second instance is built from the first's args, as
+            ``cls(*error.args)``.
+        Then:
+            It should restore every structured field with its own type
+            and render the same message.
+        """
+        # Arrange
+        error = cls(*args)
+
+        # Act
+        rebuilt = type(error)(*error.args)
+
+        # Assert
+        for field in fields:
+            assert getattr(rebuilt, field) == getattr(error, field)
+        assert str(rebuilt) == str(error)
+
+    @pytest.mark.parametrize(("cls", "args", "fields"), _RECONSTRUCTION_CASES)
+    def test___init___should_survive_the_fallback_when_its_cause_cannot_pickle(
+        self, cls, args, fields
+    ):
+        """Test the type-preserving fallback keeps the class and its fields.
+
+        Given:
+            A discovery exception whose __cause__ holds an unpicklable
+            object, so the serializer's primary dump fails and its
+            type-preserving fallback runs.
+        When:
+            It is encoded in an exception response frame and decoded.
+        Then:
+            It should warn that fidelity was lost and still arrive as
+            its own class with every structured field and the same
+            message.
+        """
+
+        # Arrange
+        class _Unpicklable(Exception):
+            def __init__(self):
+                super().__init__()
+                self._lock = threading.Lock()
+
+        error = cls(*args)
+        error.__cause__ = _Unpicklable()
+
+        # Act
+        with pytest.warns(SerializationWarning):
+            restored = _marshalled(error)
+
+        # Assert
+        assert type(restored) is cls
+        for field in fields:
+            assert getattr(restored, field) == getattr(error, field)
+        assert str(restored) == str(error)

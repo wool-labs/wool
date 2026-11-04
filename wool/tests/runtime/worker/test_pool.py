@@ -83,7 +83,7 @@ def _dropped_publish(error=None, *, only=None):
 
     Lets a worker start and register normally, then breaks teardown's
     ``worker-dropped`` announcement with ``error`` — by default the
-    ``FileNotFoundError`` an unlinked discovery segment raises, or
+    ``FileNotFoundError`` a removed discovery registry raises, or
     `_HANG` to hang the announcement forever instead, in which case
     the shutdown deadline is what ends the wait. ``only`` narrows the
     breakage to the workers whose metadata it accepts, leaving their
@@ -93,7 +93,7 @@ def _dropped_publish(error=None, *, only=None):
     error = (
         error
         if error is not None
-        else FileNotFoundError("discovery segment unlinked by a peer")
+        else FileNotFoundError("discovery registry removed by a peer")
     )
 
     async def publish(type, metadata):
@@ -139,6 +139,35 @@ class _CallableFactory:
         raise AssertionError("factory should never be called")
 
 
+class _NoProtocolDiscovery:
+    """An async context manager yielding itself, of neither discovery protocol.
+
+    Records entry and exit so a test can pin that a rejected service is
+    still exited.
+    """
+
+    def __init__(self):
+        self.events: list[str] = []
+
+    async def __aenter__(self):
+        self.events.append("enter")
+        return self
+
+    async def __aexit__(self, *args):
+        self.events.append("exit")
+
+
+class _ContextManagerSubscriber(_NoProtocolDiscovery):
+    """An async context manager that is also a discovery subscriber.
+
+    `_NoProtocolDiscovery` with ``__aiter__`` added, so the two doubles
+    differ only by `DiscoverySubscriberLike`.
+    """
+
+    def __aiter__(self):
+        return ReducibleAsyncIterator([]).__aiter__()
+
+
 class _FakeDiscovery(DiscoveryLike):
     """Custom ``DiscoveryLike`` double for admission-gate pool tests.
 
@@ -148,6 +177,10 @@ class _FakeDiscovery(DiscoveryLike):
     otherwise they return a plain mock subscriber. ``subscribe`` always
     records the predicate it was handed on ``captured_filter`` so
     filter-composition tests can evaluate it.
+
+    This double defines no ``__aiter__``, so a test needing one object
+    satisfying both `DiscoveryLike` and `DiscoverySubscriberLike` writes a
+    concrete double inline.
     """
 
     def __init__(self, mocker, events=None):
@@ -1293,7 +1326,6 @@ class TestWorkerPool:
     async def test_worker_context_default_factory_with_credentials(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         worker_credentials,
@@ -1320,7 +1352,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_without_discovery(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -1347,7 +1378,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_with_wildcard_bind_publisher(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -1380,7 +1410,6 @@ class TestWorkerPool:
     async def test_worker_context_with_bound_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -1424,7 +1453,6 @@ class TestWorkerPool:
     async def test___aenter___should_pass_identity_to_a_declaring_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1466,7 +1494,6 @@ class TestWorkerPool:
     async def test___aenter___should_forward_the_identity_its_own_policy_admits(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1515,7 +1542,6 @@ class TestWorkerPool:
     async def test___aenter___should_pass_identity_to_the_default_worker(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1552,7 +1578,6 @@ class TestWorkerPool:
     async def test___aenter___should_pass_identity_to_a_bound_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1597,7 +1622,6 @@ class TestWorkerPool:
     async def test___aenter___with_the_canonical_worker_factory_shape(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
         worker_credentials,
@@ -1645,7 +1669,6 @@ class TestWorkerPool:
     async def test___aenter___with_an_explicit_none_identity(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
     ):
         """Test an explicit None is delivered rather than withheld.
@@ -1687,7 +1710,6 @@ class TestWorkerPool:
     async def test___aenter___with_an_unset_versus_none_identity(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         configured,
         expected,
@@ -1724,7 +1746,6 @@ class TestWorkerPool:
     async def test___aenter___should_pass_no_identity_when_the_pool_declares_none(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1765,7 +1786,6 @@ class TestWorkerPool:
     async def test___aenter___should_keep_a_presupplied_identity(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -1810,7 +1830,6 @@ class TestWorkerPool:
     async def test_worker_context_with_unbound_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -1852,7 +1871,6 @@ class TestWorkerPool:
     async def test_worker_context_with_kwargs_sink_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -1897,7 +1915,6 @@ class TestWorkerPool:
     async def test_worker_context_with_positional_host_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -1942,7 +1959,6 @@ class TestWorkerPool:
     async def test_worker_context_with_prebound_partial_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -1987,7 +2003,6 @@ class TestWorkerPool:
     async def test_worker_context_with_prebound_credentials_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         worker_credentials,
     ):
@@ -2030,7 +2045,6 @@ class TestWorkerPool:
     async def test_worker_context_with_partial_unbound_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -2072,7 +2086,6 @@ class TestWorkerPool:
     async def test_worker_context_with_uninspectable_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service_for_pool,
     ):
@@ -2119,7 +2132,6 @@ class TestWorkerPool:
     async def test_worker_context_with_publisher_missing_bind_host(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -2157,7 +2169,6 @@ class TestWorkerPool:
     async def test_worker_context_with_rejected_context_manager_publisher(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -2208,7 +2219,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_with_custom_bind_host(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -2248,7 +2258,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_worker_context_default_factory_with_discovery_factory(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -2313,7 +2322,6 @@ class TestWorkerPool:
     async def test_worker_context_default_factory_with_default_mode(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -2366,7 +2374,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test___aenter___should_return_pool_when_pushed_onto_async_exit_stack(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -2392,7 +2399,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test___aexit___should_tear_down_pool_when_async_exit_stack_unwinds(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -2514,7 +2520,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test___aenter___lifecycle_returns_pool_instance(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -2541,7 +2546,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test___aexit___with_exception_in_user_code(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -2595,34 +2599,7 @@ class TestWorkerPool:
         assert "Worker startup failed" in str(exc_info.value.exceptions[0])
 
     @pytest.mark.asyncio
-    async def test___aexit___handles_exceptions_gracefully(
-        self,
-        mock_shared_memory,
-        mock_worker_proxy,
-        mock_local_worker,
-        mock_discovery_service,
-    ):
-        """Test attempt proper cleanup without additional errors.
-
-        Given:
-            A WorkerPool that encounters issues during lifecycle
-        When:
-            Context manager handles the lifecycle
-        Then:
-            Should attempt proper cleanup without additional errors
-        """
-        # Arrange - Make cleanup operations potentially fail but be handled
-        mock_shared_memory.unlink.side_effect = OSError("Cleanup failed")
-
-        # Act & assert - Should not raise exception from cleanup
-        async with WorkerPool(spawn=1) as pool:
-            assert pool is not None
-
-        # Assert: Pool was created and cleanup was attempted
-        assert isinstance(pool, WorkerPool)
-
-    @pytest.mark.asyncio
-    async def test___aexit___handles_shared_memory_cleanup_exceptions(
+    async def test___aexit___should_not_reshape_error_when_proxy_exit_raises(
         self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
     ):
         """Test handle exceptions gracefully without propagating them.
@@ -2652,7 +2629,8 @@ class TestWorkerPool:
         assert raised is None or isinstance(raised, OSError)
 
     @pytest.mark.asyncio
-    async def test___aexit___bounds_teardown_when_worker_stop_hangs(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_bound_teardown_when_worker_stop_hangs(
         self, mocker: MockerFixture
     ):
         """Test pool teardown returns within the configured shutdown bound.
@@ -2693,6 +2671,145 @@ class TestWorkerPool:
         assert elapsed < shutdown_timeout * 5
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_exit_publisher_when_shutdown_deadline_exhausted(
+        self, mocker: MockerFixture
+    ):
+        """Test the publisher's exit still runs once the deadline is spent.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns and
+            whose discovery publisher is a context manager recording its
+            exit
+        When:
+            The async-with block exits and the worker stop exhausts
+            shutdown_timeout
+        Then:
+            It should still enter the publisher's exit exactly once
+            rather than skip it, leaving no coroutine un-awaited
+        """
+        # Arrange
+        exits: list[tuple] = []
+
+        class ExitRecordingDiscovery(_FakeDiscovery):
+            @property
+            def publisher(self):
+                publisher = self._publisher
+
+                class Manager:
+                    async def __aenter__(self):
+                        return publisher
+
+                    async def __aexit__(self, *args):
+                        exits.append(args)
+                        return False
+
+                return Manager()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, grace=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        # Act
+        async with WorkerPool(
+            worker=hanging_factory,
+            spawn=1,
+            shutdown_timeout=0.05,
+            discovery=ExitRecordingDiscovery(mocker),
+        ):
+            pass
+
+        # Assert
+        assert exits == [(None, None, None)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_cancel_publisher_exit_when_cleanup_exceeds_budget(
+        self, mocker: MockerFixture, caplog
+    ):
+        """Test a publisher exit that outlives the deadline is cancelled and reported.
+
+        Given:
+            A WorkerPool whose worker has a stop() that never returns and
+            whose discovery publisher is a context manager whose exit
+            parks until cancelled
+        When:
+            The async-with block exits and the worker stop exhausts
+            shutdown_timeout
+        Then:
+            It should still enter the publisher's exit, cancel it once
+            the budget is spent, log one warning saying so, and return
+            within a small multiple of shutdown_timeout
+        """
+        # Arrange
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class ParkingDiscovery(_FakeDiscovery):
+            @property
+            def publisher(self):
+                publisher = self._publisher
+
+                class Manager:
+                    async def __aenter__(self):
+                        return publisher
+
+                    async def __aexit__(self, *args):
+                        entered.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            cancelled.set()
+                            raise
+                        return False
+
+                return Manager()
+
+        def hanging_factory(*tags, credentials=None):
+            worker = mocker.MagicMock(spec=LocalWorker)
+            worker.start = mocker.AsyncMock()
+
+            async def hang(*, grace=None):
+                await asyncio.sleep(60)
+
+            worker.stop = hang
+            worker.metadata = _make_worker_metadata()
+            return worker
+
+        shutdown_timeout = 0.05
+
+        # Act
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, "wool.runtime.worker.pool"):
+            async with WorkerPool(
+                worker=hanging_factory,
+                spawn=1,
+                shutdown_timeout=shutdown_timeout,
+                discovery=ParkingDiscovery(mocker),
+            ):
+                pass
+        elapsed = time.monotonic() - start
+
+        # Assert
+        assert entered.is_set()
+        assert cancelled.is_set()
+        messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert [
+            "publisher cleanup did not complete" in message for message in messages
+        ].count(True) == 1
+        assert elapsed < shutdown_timeout * 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_log_warning_when_workers_reaped(
         self, mocker: MockerFixture, caplog
     ):
@@ -2740,7 +2857,8 @@ class TestWorkerPool:
         )
 
     @pytest.mark.asyncio
-    async def test___aexit___cancels_pending_stops_after_timeout(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_cancel_pending_stops_when_shutdown_bound_elapses(
         self, mocker: MockerFixture
     ):
         """Test pending stop coroutines receive CancelledError on timeout.
@@ -2821,7 +2939,8 @@ class TestWorkerPool:
         )
 
     @pytest.mark.asyncio
-    async def test___aexit___does_not_block_other_cleanup_when_one_worker_hangs(
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
+    async def test___aexit___should_stop_other_workers_when_one_worker_hangs(
         self, mocker: MockerFixture
     ):
         """Test fast worker still stops when a sibling worker's stop hangs.
@@ -3027,8 +3146,8 @@ class TestWorkerPool:
     @pytest.mark.parametrize(
         "error",
         [
-            FileNotFoundError("discovery segment unlinked by a peer"),
-            PermissionError("discovery segment not writable"),
+            FileNotFoundError("discovery registry removed by a peer"),
+            PermissionError("discovery registry not writable"),
             OSError("discovery buffer corrupt"),
             ConnectionError("discovery service unreachable"),
             TimeoutError("discovery publish timed out"),
@@ -3046,7 +3165,7 @@ class TestWorkerPool:
         Given:
             A WorkerPool whose publisher raises when announcing
             worker-dropped, as it does when a peer has unlinked the
-            discovery segment out from under it
+            discovery registry out from under it
         When:
             The async-with block exits
         Then:
@@ -3077,6 +3196,7 @@ class TestWorkerPool:
         stop.assert_awaited_once_with(grace=pytest.approx(5.0, abs=0.1))
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_stop_worker_when_drop_announcement_hangs(
         self, mocker: MockerFixture
     ):
@@ -3206,6 +3326,7 @@ class TestWorkerPool:
         stop.assert_awaited_once_with(grace=-1.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("error::RuntimeWarning")
     async def test___aexit___should_log_error_when_drop_announcement_hangs(
         self, mocker: MockerFixture, caplog
     ):
@@ -3282,7 +3403,7 @@ class TestWorkerPool:
 
         discovery = _FakeDiscovery(mocker)
         discovery.publisher.publish.side_effect = _dropped_publish(
-            PermissionError("discovery segment not writable"),
+            PermissionError("discovery registry not writable"),
             only=lambda metadata: metadata is workers[1].metadata,
         )
 
@@ -3517,26 +3638,27 @@ class TestWorkerPool:
         assert stopped.is_set()
 
     @pytest.mark.asyncio
-    async def test___aenter___default_case_covers_shared_memory_creation(
+    async def test___aenter___should_enter_when_given_neither_spawn_nor_discovery(
         self,
         mocker: MockerFixture,
         mock_local_worker,
-        mock_shared_memory,
         mock_worker_proxy,
     ):
-        """Test execute the create_proxy function covering lines 238-246.
+        """Test a pool configured with no arguments at all still enters.
 
         Given:
-            WorkerPool called with default parameters (no spawn, no discovery)
+            A WorkerPool with default parameters, i.e., no spawn count
+            and no discovery service
         When:
-            Context manager is entered (which calls _proxy_factory)
+            Its context is entered
         Then:
-            Should execute the create_proxy function covering lines 238-246
+            It should yield the pool itself, building the proxy over the
+            namespace it defaults to.
         """
         # Act
         async with WorkerPool() as pool:
             # Assert
-            assert pool is not None
+            assert isinstance(pool, WorkerPool)
 
     @pytest.mark.parametrize("spawn", [1, 3, 10])
     @pytest.mark.asyncio
@@ -3675,7 +3797,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_multiple_workers_startup_and_cleanup(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -3699,7 +3820,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test___aenter___should_collect_metadata_from_every_started_worker(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -3740,7 +3860,6 @@ class TestWorkerPool:
     async def test___aenter___with_custom_worker_factory(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_discovery_service,
     ):
@@ -3797,7 +3916,6 @@ class TestWorkerPool:
     async def test___aenter___with_custom_loadbalancer(
         self,
         mocker,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -3855,7 +3973,6 @@ class TestWorkerPool:
     async def test___aenter___concurrent_operations(
         self,
         mocker,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -3917,7 +4034,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_startup_timing_performance(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service,
@@ -3946,7 +4062,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_hybrid_mode_spawn_and_discovery(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -3975,7 +4090,6 @@ class TestWorkerPool:
     async def test_hybrid_mode_spawn_zero_with_discovery(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -4028,7 +4142,6 @@ class TestWorkerPool:
     async def test_default_mode_uses_cpu_count(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -4054,7 +4167,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_ephemeral_mode_spawn_only(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -4081,7 +4193,6 @@ class TestWorkerPool:
     async def test_ephemeral_mode_spawn_zero_uses_cpu_count(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -4107,7 +4218,6 @@ class TestWorkerPool:
     @pytest.mark.asyncio
     async def test_hybrid_mode_with_tags(
         self,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -4136,7 +4246,6 @@ class TestWorkerPool:
     async def test_hybrid_mode_with_custom_loadbalancer(
         self,
         mocker,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -4164,68 +4273,186 @@ class TestWorkerPool:
         mock_worker_proxy.__aenter__.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_durable_mode_discovery_type_validation(
-        self, mocker: MockerFixture, mock_worker_proxy
+    async def test___aenter___should_raise_when_discovery_satisfies_neither_protocol(
+        self, mock_worker_proxy
     ):
-        """Test raise ValueError.
+        """Test a durable pool rejects an object of neither protocol.
 
         Given:
-            A WorkerPool with invalid discovery object (not DiscoveryLike)
+            A durable WorkerPool whose discovery satisfies neither
+            DiscoveryLike nor DiscoverySubscriberLike.
         When:
-            Pool is started
+            The pool is entered.
         Then:
-            Should raise TypeError
+            It should raise TypeError naming both accepted protocols.
         """
-
-        # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
-        # Use a simple object that explicitly lacks the required protocol methods
-        class InvalidDiscovery:
-            """Object that does not implement DiscoveryLike protocol."""
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        invalid_discovery = InvalidDiscovery()
+        # Arrange
+        discovery = _NoProtocolDiscovery()
 
         # Act & assert
-        with pytest.raises(TypeError, match="Expected DiscoveryLike"):
-            async with WorkerPool(discovery=invalid_discovery):
+        with pytest.raises(
+            TypeError, match=r"Expected DiscoveryLike \| DiscoverySubscriberLike"
+        ):
+            async with WorkerPool(discovery=discovery):
                 pass
 
     @pytest.mark.asyncio
-    async def test_hybrid_mode_discovery_type_validation(
-        self, mocker: MockerFixture, mock_worker_proxy, mock_local_worker
+    async def test___aenter___should_accept_a_subscriber_when_no_workers_spawned(
+        self, mocker: MockerFixture, mock_worker_proxy
     ):
-        """Test raise TypeError.
+        """Test a durable pool takes a bare subscriber.
 
         Given:
-            A WorkerPool with spawn and invalid discovery (not DiscoveryLike)
+            A durable WorkerPool whose discovery is a bare
+            DiscoverySubscriberLike, the form a borrower uses on a
+            namespace another process owns.
         When:
-            Pool is started
+            The pool is entered.
         Then:
-            Should raise TypeError
+            It should accept it and hand that very subscriber to the
+            proxy.
+        """
+        # Arrange
+        subscriber = ReducibleAsyncIterator([])
+
+        # Act
+        async with WorkerPool(discovery=subscriber) as pool:
+            assert pool is not None
+
+        # Assert
+        assert wp.WorkerProxy.call_args.kwargs["discovery"] is subscriber
+
+    @pytest.mark.asyncio
+    async def test___aenter___should_prefer_the_subscriber_of_a_dual_protocol_service(
+        self, mocker: MockerFixture, mock_worker_proxy
+    ):
+        """Test a full service is reduced to its subscriber.
+
+        Given:
+            A durable WorkerPool whose discovery satisfies both
+            DiscoveryLike and DiscoverySubscriberLike, i.e., it exposes
+            publisher, subscriber and subscribe, and is itself iterable.
+        When:
+            The pool is entered.
+        Then:
+            It should hand the proxy the service's subscriber.
         """
 
-        # Arrange - Create discovery that doesn't implement DiscoveryLike protocol
-        # Use a simple object that explicitly lacks the required protocol methods
-        class InvalidDiscovery:
-            """Object that does not implement DiscoveryLike protocol."""
+        # Arrange — a concrete double (see `_FakeDiscovery`)
+        class DualProtocolDiscovery:
+            """A full discovery service that is also directly iterable."""
 
-            async def __aenter__(self):
-                return self
+            def __init__(self):
+                self.subscriber_sentinel = mocker.MagicMock()
 
-            async def __aexit__(self, *args):
+            def __aiter__(self):
+                raise AssertionError("the service itself must not be iterated")
+
+            @property
+            def publisher(self):
+                return mocker.MagicMock()
+
+            @property
+            def subscriber(self):
+                return self.subscriber_sentinel
+
+            def subscribe(self, filter=None, **kwargs):
+                raise AssertionError("durable mode must not call subscribe")
+
+        discovery = DualProtocolDiscovery()
+
+        # Act
+        async with WorkerPool(discovery=discovery):
+            pass
+
+        # Assert
+        assert (
+            wp.WorkerProxy.call_args.kwargs["discovery"] is discovery.subscriber_sentinel
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "discovery",
+        [
+            pytest.param(ReducibleAsyncIterator([]), id="bare-subscriber"),
+            pytest.param(_NoProtocolDiscovery(), id="no-protocol"),
+        ],
+    )
+    async def test___aenter___should_raise_when_spawning_discovery_lacks_a_publisher(
+        self, mock_worker_proxy, mock_local_worker, discovery
+    ):
+        """Test a spawning pool rejects a discovery with no publisher.
+
+        Given:
+            A WorkerPool with spawn set whose discovery does not
+            satisfy DiscoveryLike: a bare subscriber, or an object of
+            neither protocol.
+        When:
+            The pool is entered.
+        Then:
+            It should raise TypeError naming DiscoveryLike alone.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match=r"Expected DiscoveryLike, got"):
+            async with WorkerPool(spawn=1, discovery=discovery):
                 pass
 
-        invalid_discovery = InvalidDiscovery()
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("spawn", [None, 1], ids=["durable", "spawning"])
+    async def test___aenter___should_exit_a_rejected_discovery_context(
+        self, mock_worker_proxy, mock_local_worker, spawn
+    ):
+        """Test a rejected discovery context manager is still exited.
 
-        # Act & assert - This tests line 212 (TypeError)
-        with pytest.raises(TypeError, match="Expected DiscoveryLike"):
-            async with WorkerPool(spawn=2, discovery=invalid_discovery):
+        Given:
+            A WorkerPool, durable or spawning, whose discovery is an
+            async context manager yielding an object of neither
+            protocol.
+        When:
+            The pool is entered and rejects it.
+        Then:
+            It should have exited the context it entered.
+        """
+        # Arrange
+        discovery = _NoProtocolDiscovery()
+
+        # Act
+        with pytest.raises(TypeError, match=r"Expected DiscoveryLike"):
+            async with WorkerPool(spawn=spawn, discovery=discovery):
                 pass
+
+        # Assert
+        assert discovery.events == ["enter", "exit"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("as_factory", [False, True], ids=["instance", "factory"])
+    async def test___aenter___should_enter_a_context_manager_subscriber_once(
+        self, as_factory
+    ):
+        """Test a durable pool enters a subscriber exactly once.
+
+        Given:
+            A durable WorkerPool driving a real proxy, whose discovery
+            is a subscriber that is itself an async context manager,
+            supplied as an instance or as a factory producing one.
+        When:
+            The pool is entered and exited.
+        Then:
+            It should enter and exit that subscriber exactly once.
+        """
+        # Arrange
+        subscriber = _ContextManagerSubscriber()
+
+        # Act
+        async with WorkerPool(
+            discovery=(lambda: subscriber) if as_factory else subscriber,
+            quorum=None,
+            lazy=False,
+        ):
+            pass
+
+        # Assert
+        assert subscriber.events == ["enter", "exit"]
 
     @pytest.mark.asyncio
     async def test_hybrid_mode_negative_spawn_raises_error(
@@ -4300,8 +4527,15 @@ class TestWorkerPool:
             WorkerPool(spawn=negative_spawn)
 
     @given(spawn=st.integers(min_value=1, max_value=20))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_worker_count_bounded(self, mock_worker_factory, spawn):
@@ -4333,8 +4567,15 @@ class TestWorkerPool:
         assert len(started) == spawn
 
     @given(tags=st.lists(st.text(min_size=1, max_size=10), min_size=0, max_size=5))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_tags_preserved(self, mock_worker_factory, tags):
@@ -4367,8 +4608,15 @@ class TestWorkerPool:
         assert all(worker.tags == set(tags) for worker in started)
 
     @given(spawn=st.integers(min_value=1, max_value=10))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_cleanup_complete(self, mock_worker_factory, spawn):
@@ -4404,8 +4652,15 @@ class TestWorkerPool:
         spawn=st.integers(min_value=1, max_value=5),
         tags=st.lists(st.text(min_size=1, max_size=8), min_size=1, max_size=3),
     )
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test___aenter___should_refuse_re_entry_for_any_configuration(
@@ -4430,8 +4685,15 @@ class TestWorkerPool:
                 await pool.__aenter__()
 
     @given(exception_type=st.sampled_from([ValueError, RuntimeError, TypeError]))
+    # No deadline: each example enters a real pool, and the discovery
+    # publishes its workers under a cross-process lock that genuinely
+    # serializes them, so an example's wall-clock cost scales with the
+    # generated worker count and with whatever else the host is doing.
+    # A per-example timing bound measures the machine, not the property.
     @settings(
-        max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture]
+        max_examples=100,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @pytest.mark.asyncio
     async def test_property_exception_propagation(
@@ -4465,17 +4727,18 @@ class TestWorkerPool:
         assert str(caught_exception) == exception_message
 
     @pytest.mark.asyncio
-    async def test_enter_context_with_awaitable(
-        self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
+    async def test___aenter___should_resolve_discovery_when_awaitable(
+        self, mocker: MockerFixture, mock_local_worker
     ):
-        """Test await the Awaitable and return the result.
+        """Test entering the pool awaits an awaitable discovery factory.
 
         Given:
             WorkerPool with a discovery factory that returns an Awaitable
         When:
-            _enter_context is called
+            The pool is entered
         Then:
-            It should await the Awaitable and return the result
+            It should await the Awaitable and hand its subscriber to the
+            proxy
         """
 
         # Arrange
@@ -4496,8 +4759,10 @@ class TestWorkerPool:
             def subscribe(self, filter=None):
                 return self._subscriber
 
+        discovery = ConcreteDiscovery()
+
         async def discovery_awaitable():
-            return ConcreteDiscovery()
+            return discovery
 
         # Patch WorkerProxy to avoid actual proxy initialization
         mock_proxy = mocker.MagicMock()
@@ -4507,23 +4772,28 @@ class TestWorkerPool:
 
         pool = WorkerPool(discovery=discovery_awaitable)
 
-        # Act & assert - should not raise
+        # Act
         async with pool:
             pass
 
+        # Assert
+        assert (
+            pool_module.WorkerProxy.call_args.kwargs["discovery"] is discovery.subscriber
+        )
+
     @pytest.mark.asyncio
-    async def test_enter_context_with_plain_object(
-        self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
+    async def test___aenter___should_resolve_discovery_when_plain_object(
+        self, mocker: MockerFixture, mock_local_worker
     ):
-        """Test return the object directly.
+        """Test entering the pool passes a plain discovery object through.
 
         Given:
             WorkerPool with a discovery that is a plain object (not
             callable/context manager)
         When:
-            _enter_context is called
+            The pool is entered
         Then:
-            It should return the object directly
+            It should hand the object's subscriber to the proxy
         """
 
         # Arrange
@@ -4554,20 +4824,26 @@ class TestWorkerPool:
 
         pool = WorkerPool(discovery=mock_discovery)
 
-        # Act & assert - should not raise
+        # Act
         async with pool:
             pass
 
+        # Assert
+        assert (
+            pool_module.WorkerProxy.call_args.kwargs["discovery"]
+            is mock_discovery.subscriber
+        )
+
     @pytest.mark.asyncio
-    async def test_exit_context_with_sync_context_manager(
-        self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
+    async def test___aexit___should_exit_sync_context_manager_when_discovery_is_one(
+        self, mocker: MockerFixture, mock_local_worker
     ):
-        """Test call __exit__ on the context manager.
+        """Test exiting the pool exits a synchronous discovery context manager.
 
         Given:
             WorkerPool with a discovery that is a synchronous ContextManager
         When:
-            _exit_context is called
+            The pool is exited
         Then:
             It should call __exit__ on the context manager
         """
@@ -4614,8 +4890,50 @@ class TestWorkerPool:
         assert exit_called[0]
 
     @pytest.mark.asyncio
+    async def test___aenter___should_size_its_own_registry_to_the_workers_it_spawns(
+        self, mocker: MockerFixture
+    ):
+        """Test a pool owning its registry sizes it for every worker it spawns.
+
+        Given:
+            A WorkerPool spawning more workers than the discovery
+            backend's default capacity, with no discovery service of its
+            own supplied
+        When:
+            The pool is entered and constructs the LocalDiscovery it owns
+        Then:
+            It should pass a capacity of at least the spawn count, so the
+            registration of the last worker cannot be refused for want of
+            a slot on a host with more CPUs than that default.
+        """
+
+        # Arrange — a constructor spy rather than a behavioural oracle:
+        # exercising the boundary honestly would mean spawning more real
+        # worker processes than the default capacity. This is wiring
+        # coverage and patches a collaborator, with the precedent below.
+        # Entry is abandoned the moment the capacity has been observed,
+        # so no worker is ever spawned.
+        class _Abandon(Exception):
+            pass
+
+        mock_discovery = mocker.MagicMock()
+        mock_discovery.__enter__ = mocker.MagicMock(side_effect=_Abandon)
+        discovery_class = mocker.patch(
+            "wool.runtime.worker.pool.LocalDiscovery", return_value=mock_discovery
+        )
+
+        # Act
+        with pytest.raises(_Abandon):
+            async with WorkerPool(spawn=200):
+                pass
+
+        # Assert
+        assert discovery_class.call_args is not None
+        assert discovery_class.call_args.kwargs["capacity"] >= 200
+
+    @pytest.mark.asyncio
     async def test_worker_context_publisher_type_validation(
-        self, mocker: MockerFixture, mock_shared_memory, mock_local_worker
+        self, mocker: MockerFixture, mock_local_worker
     ):
         """Test raise TypeError.
 
@@ -4833,7 +5151,6 @@ class TestWorkerPool:
     async def test___aenter___hybrid_mode_forwards_lease(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -4990,7 +5307,6 @@ class TestWorkerPool:
         mocker: MockerFixture,
         mock_worker_proxy,
         mock_local_worker,
-        mock_shared_memory,
     ):
         """Test hybrid subscriptions carry tag semantics only.
 
@@ -5051,7 +5367,6 @@ class TestWorkerPool:
         mocker: MockerFixture,
         mock_worker_proxy,
         mock_local_worker,
-        mock_shared_memory,
     ):
         """Test untagged hybrid subscriptions match every worker.
 
@@ -5169,7 +5484,6 @@ class TestWorkerPool:
     async def test___aenter___no_lease_forwards_none(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -5291,9 +5605,7 @@ class TestWorkerPool:
             WorkerPool(spawn=2, quorum=None, quorum_timeout=30)
 
     @pytest.mark.asyncio
-    async def test___aenter___with_negative_quorum_raises(
-        self, mock_shared_memory, mock_local_worker
-    ):
+    async def test___aenter___with_negative_quorum_raises(self, mock_local_worker):
         """Test negative quorum is rejected at context entry.
 
         Given:
@@ -5426,7 +5738,7 @@ class TestWorkerPool:
 
     @pytest.mark.asyncio
     async def test___aenter___with_non_positive_quorum_timeout_raises(
-        self, mock_shared_memory, mock_local_worker
+        self, mock_local_worker
     ):
         """Test non-positive quorum_timeout is rejected at context entry.
 
@@ -5446,7 +5758,6 @@ class TestWorkerPool:
     async def test___aenter___forwards_quorum(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -5478,7 +5789,6 @@ class TestWorkerPool:
     async def test___aenter___forwards_default_quorum(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -5511,7 +5821,6 @@ class TestWorkerPool:
     async def test___aenter___forwards_quorum_none(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -5545,7 +5854,6 @@ class TestWorkerPool:
     async def test___aenter___forwards_quorum_zero(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
     ):
@@ -5613,7 +5921,6 @@ class TestWorkerPool:
     async def test___aenter___hybrid_mode_forwards_quorum(
         self,
         mocker: MockerFixture,
-        mock_shared_memory,
         mock_worker_proxy,
         mock_local_worker,
         mock_discovery_service_for_pool,
@@ -5644,10 +5951,14 @@ class TestWorkerPool:
         assert proxy_kwargs["quorum"] == 3
 
     @given(quorum=st.integers(min_value=-100, max_value=-1))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+    # No deadline: entry reaches the discovery publish path, whose
+    # cross-process lock genuinely serializes, so a per-example timing
+    # bound measures the host rather than the property. See the pool
+    # property tests above.
+    @settings(deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @pytest.mark.asyncio
     async def test___aenter___rejects_negative_quorum_pbt(
-        self, quorum, mock_shared_memory, mock_local_worker
+        self, quorum, mock_local_worker
     ):
         """Test negative quorum values are rejected at context entry.
 

@@ -787,7 +787,7 @@ class TestDispatchSession:
         Given:
             A request stream whose first frame triggers an
             :class:`asyncio.CancelledError` raised directly from
-            :meth:`ChainManifest.from_protobuf` (e.g. cancellation
+            :meth:`ChainManifest.from_protobuf` (e.g., cancellation
             arriving mid-decode).
         When:
             The handler is entered via ``async with``.
@@ -2667,7 +2667,7 @@ class TestDispatchSession:
 
         Given:
             A handler whose worker loop has been closed after the
-            worker task was scheduled (e.g. graceful shutdown
+            worker task was scheduled (e.g., graceful shutdown
             landing between two main-loop pumps)
         When:
             :meth:`cancel` is awaited
@@ -2878,7 +2878,7 @@ class TestDispatchSession:
 
         Regression test for the cross-loop race when the dispatch's
         terminal-exception clause is reached while the worker is
-        still alive. Main-loop handler-level failures (e.g.
+        still alive. Main-loop handler-level failures (e.g.,
         ``response.to_protobuf`` raising on dump) reach the except
         clause with the worker mid-``_step`` mutating the work
         chain. Without an explicit drain before reading

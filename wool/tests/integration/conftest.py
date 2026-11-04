@@ -7,7 +7,10 @@ fixtures, and builder functions for composable integration tests.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,9 +18,11 @@ import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import fields
+from dataclasses import replace
 from enum import Enum
 from enum import auto
 from functools import partial
@@ -30,13 +35,20 @@ from hypothesis import strategies as st
 
 from tests.helpers import LOOPBACK_SANS
 from tests.helpers import generate_ca_and_leaf
+from tests.helpers import namespace_directory
 from wool.runtime.context.runtime import dispatch_timeout
+from wool.runtime.discovery import __subscriber_pool__
+from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.discovery.pool import install_subscriber_pool
 from wool.runtime.loadbalancer.base import NoWorkersAvailable
 from wool.runtime.loadbalancer.roundrobin import RoundRobinLoadBalancer
+from wool.runtime.typing import resolved
 from wool.runtime.worker.auth import WorkerCredentials
 from wool.runtime.worker.base import ChannelOptions
 from wool.runtime.worker.base import WorkerOptions
+from wool.runtime.worker.connection import channel_pool_hold_stats
+from wool.runtime.worker.connection import channel_pool_stats
 from wool.runtime.worker.local import LocalWorker
 from wool.runtime.worker.pool import WorkerPool
 
@@ -47,24 +59,81 @@ from .routines import ContextVarPattern
 _TIMEOUT = 30
 
 
-async def poll_until_count(get_uids, expected_count, *, timeout=5.0, interval=0.02):
-    """Poll get_uids() until it reports expected_count uids, or fail.
+async def poll_until(
+    get, predicate, *, description, timeout=5.0, interval=0.02, tolerate=()
+):
+    """Poll ``get()`` until ``predicate`` accepts its value, or fail.
 
-    Returns the uid set once its size equals expected_count. Replaces a
-    fixed settle sleep: it waits no longer than necessary and fails
-    loudly — rather than silently passing on a change that arrived late
-    — if the count never reaches the expected value within the deadline.
+    Returns the accepted value. ``get`` may be sync or async: an
+    awaitable value is awaited before the predicate sees it. An
+    exception in ``tolerate`` counts as "not yet" rather than a failure,
+    for a probe whose subject may not exist yet. Replaces a fixed settle
+    sleep: it waits no longer than necessary and fails loudly — rather
+    than silently passing on a change that arrived late — if no value
+    satisfies ``predicate`` within the deadline, naming ``description``
+    and the last value, or tolerated exception, seen.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
-        uids = get_uids()
-        if len(uids) == expected_count:
-            return uids
-        assert loop.time() < deadline, (
-            f"admitted count never reached {expected_count}; last saw {len(uids)}"
-        )
+        try:
+            value = get()
+            if inspect.isawaitable(value):
+                value = await value
+        except tolerate as exc:
+            value = exc
+        else:
+            if predicate(value):
+                return value
+        assert loop.time() < deadline, f"{description}; last saw {value!r}"
         await asyncio.sleep(interval)
+
+
+async def poll_until_count(get_uids, expected_count, *, timeout=5.0, interval=0.02):
+    """Poll ``get_uids()`` until it reports ``expected_count`` uids, or fail."""
+    return await poll_until(
+        get_uids,
+        lambda uids: len(uids) == expected_count,
+        description=f"admitted count never reached {expected_count}",
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+async def poll_until_channel_pool_settles(
+    *, get=channel_pool_stats, timeout=5.0, interval=0.02
+):
+    """Poll a channel pool until it caches nothing, or fail.
+
+    Returns the settled `wool.runtime.resourcepool.ResourcePool.Stats`
+    once ``total_entries`` reaches zero. ``get`` reads the stats, this
+    process's own by default, or a worker's through a probe routine. The
+    channel a pool exit retires closes a beat after ``__aexit__``
+    returns, so a bare assertion on the counters races that lag; the
+    failure message carries the last snapshot so a real leak names what
+    it stranded.
+    """
+    return await poll_until(
+        get,
+        lambda stats: stats.total_entries == 0,
+        description="channel pool never settled to zero entries",
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+async def run_on_foreign_loop(factory):
+    """Run ``factory()`` to completion on a fresh loop on another thread.
+
+    Returns whatever the coroutine returns. ``asyncio.run`` closes its
+    loop the moment the coroutine finishes, so whatever the coroutine
+    left in a loop-partitioned `~wool.runtime.resourcepool.ResourcePool`
+    is stranded exactly as it would be in a program whose loop closes —
+    which is the condition these tests are about. The factory is called
+    on the worker thread so the coroutine is never created on the
+    calling loop's thread.
+    """
+    return await asyncio.to_thread(lambda: asyncio.run(factory()))
 
 
 async def poll_dispatch_until_pid(target_pid, message, *, timeout=15.0, interval=0.1):
@@ -74,16 +143,14 @@ async def poll_dispatch_until_pid(target_pid, message, *, timeout=15.0, interval
     event being published and the sentinel admitting the worker, so an
     empty pool mid-propagation is retried rather than raised.
     """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while True:
-        try:
-            if await routines.get_pid() == target_pid:
-                return
-        except NoWorkersAvailable:
-            pass
-        assert loop.time() < deadline, message
-        await asyncio.sleep(interval)
+    await poll_until(
+        routines.get_pid,
+        lambda pid: pid == target_pid,
+        description=message,
+        tolerate=(NoWorkersAvailable,),
+        timeout=timeout,
+        interval=interval,
+    )
 
 
 async def poll_dispatch_until_unavailable(message, *, timeout=15.0, interval=0.1):
@@ -93,15 +160,20 @@ async def poll_dispatch_until_unavailable(message, *, timeout=15.0, interval=0.1
     evicted worker is observable only as a dispatch that can no longer
     be routed.
     """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while True:
+
+    async def routed():
         try:
-            await routines.get_pid()
+            return await routines.get_pid()
         except NoWorkersAvailable:
-            return
-        assert loop.time() < deadline, message
-        await asyncio.sleep(interval)
+            return None
+
+    await poll_until(
+        routed,
+        lambda pid: pid is None,
+        description=message,
+        timeout=timeout,
+        interval=interval,
+    )
 
 
 class RoutineShape(Enum):
@@ -120,11 +192,25 @@ class PoolMode(Enum):
     DEFAULT = auto()
     EPHEMERAL = auto()
     DURABLE = auto()
-    DURABLE_JOINED = auto()
+    DURABLE_BORROWED = auto()
     DURABLE_SHARED = auto()
     HYBRID = auto()
     NESTED_DEFAULT_IN_EPHEMERAL = auto()
     NESTED_EPHEMERAL_IN_EPHEMERAL = auto()
+    NESTED_RETIRED_IN_EPHEMERAL = auto()
+
+
+#: The pool modes that spawn LAN `LocalWorker` processes themselves.
+_SPAWNING_MODES = frozenset(
+    {
+        PoolMode.DEFAULT,
+        PoolMode.EPHEMERAL,
+        PoolMode.HYBRID,
+        PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
+        PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+        PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
+    }
+)
 
 
 class DiscoveryFactory(Enum):
@@ -205,7 +291,7 @@ class StrictWarnings(Enum):
 # Optional Scenario dimension — defaulted to ``None`` and excluded
 # from :attr:`Scenario.is_complete` so the existing pairwise covering
 # array (which leaves it unset) remains valid. It is populated only
-# on explicitly-enumerated scenarios (e.g. ``test_unified_driver``)
+# on explicitly-enumerated scenarios (e.g., ``test_unified_driver``)
 # to document observable annotations.
 _OPTIONAL_DIMENSIONS: frozenset[str] = frozenset({"strict_warnings"})
 
@@ -341,7 +427,7 @@ class _DirectDiscovery:
     """Wraps an already-entered discovery service as a plain object.
 
     Does NOT implement ``__enter__``/``__exit__``/``__aenter__``/
-    ``__aexit__``, forcing ``WorkerPool._enter_context`` to take the
+    ``__aexit__``, so the pool's dependency resolution takes the
     passthrough path. Used for the ``*_DIRECT`` factory form arrangements.
 
     ``publisher`` overrides the wrapped service's publisher, for tests
@@ -372,7 +458,7 @@ class _DirectDiscovery:
 # as a plain coroutine, breaking ``async with`` analysis at every call site.
 @asynccontextmanager
 async def build_pool_from_scenario(
-    scenario, credentials_map, *, backpressure=None
+    scenario, credentials_map, *, backpressure=None, proxy_pool_ttl=None
 ) -> AsyncIterator[WorkerPool]:
     """Build and enter a WorkerPool from a complete Scenario.
 
@@ -382,8 +468,18 @@ async def build_pool_from_scenario(
     :param backpressure:
         Optional admission-control hook that overrides the hook the
         ``BackpressureMode`` dimension would otherwise resolve. Tests
-        that need a bespoke (e.g. context-var-aware) hook pass it here
-        rather than building a :class:`WorkerPool` by hand.
+        that need a bespoke (e.g., context-var-aware) hook pass it here
+        rather than building a `WorkerPool` by hand.
+    :param proxy_pool_ttl:
+        Optional idle TTL, in seconds, for the proxy pool each
+        spawned `wool.LocalWorker` caches its nested-dispatch
+        proxies in. ``None`` leaves the worker's own default in
+        place. Applies only to the LAN `LocalWorker` processes the
+        builder spawns itself, so a durable mode, which spawns none,
+        rejects it.
+    :raises ValueError:
+        If the scenario is incomplete, or ``proxy_pool_ttl`` is not
+        positive or is given for a pool mode that spawns no workers.
     """
     missing = [
         f.name
@@ -392,6 +488,10 @@ async def build_pool_from_scenario(
     ]
     if missing:
         raise ValueError(f"Scenario incomplete; missing required dimensions: {missing}")
+    if proxy_pool_ttl is not None and proxy_pool_ttl <= 0:
+        raise ValueError("proxy_pool_ttl must be positive")
+    if proxy_pool_ttl is not None and scenario.pool_mode not in _SPAWNING_MODES:
+        raise ValueError("proxy_pool_ttl applies only to pools that spawn LAN workers")
 
     creds = credentials_map[scenario.credential]
 
@@ -435,7 +535,7 @@ async def build_pool_from_scenario(
 
     if (
         scenario.discovery is not DiscoveryFactory.NONE
-        and scenario.pool_mode is not PoolMode.DURABLE_JOINED
+        and scenario.pool_mode is not PoolMode.DURABLE_BORROWED
     ):
         namespace = f"integration-{uuid.uuid4().hex[:12]}"
 
@@ -444,12 +544,12 @@ async def build_pool_from_scenario(
                 discovery_obj = LocalDiscovery(namespace)
             case DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
                 # A sub-page capacity (4 slots) that still admits the
-                # single HYBRID worker — exercises the sized segment and
+                # single HYBRID worker — exercises the sized registry and
                 # capacity-bounded publish/subscribe scans end-to-end.
                 discovery_obj = LocalDiscovery(namespace, capacity=4)
             case DiscoveryFactory.LOCAL_CAPACITY_EXACT:
                 # Capacity exactly equal to the single HYBRID-spawned
-                # worker: the segment is completely full the moment that
+                # worker: the registry is completely full the moment that
                 # worker announces, yet still admits it and dispatches —
                 # the tightest end-to-end bound satisfying the
                 # dispatch-success oracle.
@@ -526,8 +626,8 @@ async def build_pool_from_scenario(
                     lb, creds, options, lazy, quorum, backpressure=bp_hook
                 ) as pool:
                     yield pool
-            elif scenario.pool_mode is PoolMode.DURABLE_JOINED:
-                async with _durable_joined_pool_context(
+            elif scenario.pool_mode is PoolMode.DURABLE_BORROWED:
+                async with _durable_borrowed_pool_context(
                     scenario.discovery,
                     lb,
                     creds,
@@ -538,6 +638,11 @@ async def build_pool_from_scenario(
                 ) as pool:
                     yield pool
             else:
+                worker = partial(
+                    LocalWorker, host="127.0.0.1", options=options, backpressure=bp_hook
+                )
+                if proxy_pool_ttl is not None:
+                    worker = partial(worker, proxy_pool_ttl=proxy_pool_ttl)
                 pool_kwargs = {
                     "loadbalancer": lb,
                     "credentials": creds,
@@ -550,37 +655,53 @@ async def build_pool_from_scenario(
                     # keyword outright rather than pre-supply it.
                     # The publisher-prescribed bind host is covered by
                     # test_lan_publish.py.
-                    "worker": partial(
-                        LocalWorker,
-                        host="127.0.0.1",
-                        options=options,
-                        backpressure=bp_hook,
-                    ),
+                    "worker": worker,
                     "lazy": lazy,
                     "quorum": quorum,
                 }
                 match scenario.pool_mode:
                     case PoolMode.DEFAULT:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.EPHEMERAL:
-                        pool_kwargs["size"] = 2
+                        pool_kwargs["spawn"] = 2
                     case PoolMode.HYBRID:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                         pool_kwargs["discovery"] = discovery_obj
                     case PoolMode.NESTED_DEFAULT_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
                     case PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL:
-                        pool_kwargs["size"] = 1
+                        pool_kwargs["spawn"] = 1
+                    case PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        pool_kwargs["spawn"] = 1
 
                 pool = WorkerPool(**pool_kwargs)
                 async with pool:
-                    if scenario.pool_mode in (
+                    if scenario.pool_mode is PoolMode.NESTED_RETIRED_IN_EPHEMERAL:
+                        # The inner pool is entered, dispatched through,
+                        # and left again before the outer pool is yielded,
+                        # so the test body runs on a loop where a nested
+                        # pool has already retired. The inner dispatch is
+                        # load-bearing: a pool that never dispatches opens
+                        # no channel, and its exit would retire nothing.
+                        nested_pool = WorkerPool(
+                            spawn=1,
+                            credentials=creds,
+                            worker=partial(LocalWorker, options=options),
+                        )
+                        async with nested_pool:
+                            assert await routines.add(1, 2) == 3
+                        yield pool
+                    elif scenario.pool_mode in (
                         PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
                         PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
                     ):
                         # Nested pool modes verify that entering a second
                         # WorkerPool context doesn't break the outer pool.
-                        # Dispatch still goes through the outer pool.
+                        # The inner pool stays entered while the test body
+                        # runs, and entering a pool makes its proxy the
+                        # ambient one, so the body's dispatches route
+                        # through the inner pool — the outer pool's job
+                        # here is to still be usable on the way out.
                         nested_size = (
                             2
                             if scenario.pool_mode
@@ -588,7 +709,7 @@ async def build_pool_from_scenario(
                             else 1
                         )
                         nested_pool = WorkerPool(
-                            size=nested_size,
+                            spawn=nested_size,
                             credentials=creds,
                             worker=partial(LocalWorker, options=options),
                         )
@@ -647,11 +768,10 @@ async def _durable_shared_pool_context(
 ):
     """Create two pools sharing the same LocalDiscovery subscriber.
 
-    Exercises ``SubscriberMeta`` singleton caching and
-    ``_SharedSubscription`` fan-out: both pools call
-    ``Subscriber(namespace)`` through the metaclass, the second
-    hits the cache and gets a separate ``_SharedSubscription``
-    backed by the same raw subscriber and source iterator.
+    Exercises `SubscriberMeta` subscription sharing: both pools
+    construct `LocalDiscovery.Subscriber` on one namespace in one
+    context, so each gets its own `_Subscription` backed by one
+    underlying subscriber.
     """
     namespace = f"shared-{uuid.uuid4().hex[:12]}"
     with LocalDiscovery(namespace) as discovery:
@@ -688,70 +808,101 @@ async def _durable_shared_pool_context(
             await worker.stop()
 
 
-_LOCAL_FACTORIES = (
+#: The D3 members that supply a borrowed subscriber under
+#: DURABLE_BORROWED. A borrower declares no capacity, so the capacity
+#: members differ only in what the owner stamps; LOCAL_CAPACITY_BOUNDED
+#: covers that variation, and LOCAL_CAPACITY_EXACT is excluded because
+#: it adds rows without adding a code path.
+_BORROWED_SUPPLY_FORMS = (
     DiscoveryFactory.LOCAL_DIRECT,
     DiscoveryFactory.LOCAL_CALLABLE,
     DiscoveryFactory.LOCAL_SYNC_CM,
     DiscoveryFactory.LOCAL_ASYNC_CM,
+    DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
 )
 
 
-def _resolve_joiner(namespace, factory):
-    """Resolve a DiscoveryFactory into a joiner discovery object.
+def _resolve_borrower(namespace, factory):
+    """Resolve a D3 member into a borrowed subscriber for ``namespace``.
 
-    Uses the given namespace (same as the owner), triggering the non-owner
-    fallback path in ``LocalDiscovery.__enter__``.
-
-    Returns ``(discovery_obj, entered_cm_or_None)``. The caller must
-    exit the CM (if non-None) when done.
+    The subscriber borrows the registry the namespace's owner created
+    (see `LocalDiscovery`). Each member picks the form the subscriber is
+    supplied in: bare, callable, sync context manager, or async context
+    manager. LOCAL_CAPACITY_BOUNDED supplies the bare form (see
+    `_BORROWED_SUPPLY_FORMS`). A durable pool accepts any of these forms
+    (see `WorkerPool`).
     """
     match factory:
-        case DiscoveryFactory.LOCAL_DIRECT:
-            cm = LocalDiscovery(namespace)
-            cm.__enter__()
-            return _DirectDiscovery(cm), cm
+        case DiscoveryFactory.LOCAL_DIRECT | DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+            # See `_BORROWED_SUPPLY_FORMS`.
+            return LocalDiscovery.Subscriber(namespace)
         case DiscoveryFactory.LOCAL_CALLABLE:
-            return (lambda: LocalDiscovery(namespace)), None  # noqa: E731
+            return lambda: LocalDiscovery.Subscriber(namespace)  # noqa: E731
         case DiscoveryFactory.LOCAL_SYNC_CM:
-            return LocalDiscovery(namespace), None
+
+            @contextmanager
+            def _cm():
+                yield LocalDiscovery.Subscriber(namespace)
+
+            return _cm()
         case DiscoveryFactory.LOCAL_ASYNC_CM:
 
             @asynccontextmanager
             async def _acm():
-                with LocalDiscovery(namespace) as d:
-                    yield d
+                yield LocalDiscovery.Subscriber(namespace)
 
-            return _acm(), None
+            return _acm()
         case _:
-            raise ValueError(f"Unsupported factory for joiner: {factory}")
+            raise ValueError(f"Unsupported factory for borrower: {factory}")
 
 
 @asynccontextmanager
-async def _durable_joined_pool_context(
+async def _durable_borrowed_pool_context(
     discovery_factory, lb, creds, options, lazy, quorum, *, backpressure=None
 ):
-    """Create a DURABLE pool that joins an externally owned namespace.
+    """Yield a DURABLE pool that borrows an externally owned namespace.
 
-    Sets up an owner ``LocalDiscovery`` that creates workers and publishes
-    them, then resolves a joiner discovery from the D3 factory form. The
-    joiner reuses the owner's namespace, exercising the non-owner fallback
-    path in ``LocalDiscovery.__enter__``.
+    Start one worker, publish it through an owning `LocalDiscovery`, and
+    build the pool on the subscriber `_resolve_borrower` supplies for the
+    D3 member. LOCAL_CAPACITY_BOUNDED stamps the owner with a capacity of
+    four; every other D3 member leaves the owner at its default.
+
+    .. rubric:: Implementation notes
+
+    The mode rests on the pool receiving a bare subscriber, which the
+    guard asserts for every supply form: it resolves a throwaway
+    borrower with `resolved`, as the pool does, so the callable form is
+    called and the context-manager forms are entered before the check.
     """
-    namespace = f"joined-{uuid.uuid4().hex[:12]}"
+    namespace = f"borrowed-{uuid.uuid4().hex[:12]}"
 
     worker = LocalWorker(credentials=creds, options=options, backpressure=backpressure)
     await worker.start()
     try:
-        owner = LocalDiscovery(namespace)
+        # A sub-page cap of four admits the single worker published below
+        # and gives the borrower a stamped registry to read.
+        if discovery_factory is DiscoveryFactory.LOCAL_CAPACITY_BOUNDED:
+            owner = LocalDiscovery(namespace, capacity=4)
+        else:
+            owner = LocalDiscovery(namespace)
         owner.__enter__()
         try:
             publisher = owner.publisher
             async with publisher:
                 await publisher.publish("worker-added", worker.metadata)
-                joiner, _joiner_cm = _resolve_joiner(namespace, discovery_factory)
+                borrower = _resolve_borrower(namespace, discovery_factory)
+                # Vacuity guard — see this builder's docstring. The probe is
+                # a throwaway resolution because the context-manager forms
+                # are single-use.
+                probe = _resolve_borrower(namespace, discovery_factory)
+                async with resolved(probe) as supplied:
+                    assert not isinstance(supplied, DiscoveryLike), (
+                        "DURABLE_BORROWED must supply a bare subscriber, "
+                        f"got a DiscoveryLike: {type(supplied)}"
+                    )
                 try:
                     pool = WorkerPool(
-                        discovery=joiner,
+                        discovery=borrower,
                         loadbalancer=lb,
                         credentials=creds,
                         lazy=lazy,
@@ -760,8 +911,6 @@ async def _durable_joined_pool_context(
                     async with pool:
                         yield pool
                 finally:
-                    if _joiner_cm is not None:
-                        _joiner_cm.__exit__(None, None, None)
                     await publisher.publish("worker-dropped", worker.metadata)
         finally:
             owner.__exit__(None, None, None)
@@ -1197,6 +1346,23 @@ _NESTED_ONLY_PATTERNS = (
 # aclose scripts and the single-yield shape do not, so the pattern is
 # constrained to ASYNC_GEN_ANEXT.
 _MID_STREAM_FORWARD_SHAPES = (RoutineShape.ASYNC_GEN_ANEXT,)
+# The two halves of the D2/D3 constraint, hoisted so ``_pairwise_filter``
+# and ``scenarios_strategy`` read them from one place: a pool mode added
+# to one list and forgotten in the other would let the strategy generate
+# rows the pairwise array rejects (or the reverse).
+_DISCOVERY_REQUIRED_POOL_MODES = (
+    PoolMode.HYBRID,
+    PoolMode.DURABLE_BORROWED,
+)
+_DISCOVERY_FORBIDDEN_POOL_MODES = (
+    PoolMode.DEFAULT,
+    PoolMode.EPHEMERAL,
+    PoolMode.DURABLE,
+    PoolMode.DURABLE_SHARED,
+    PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
+    PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
+    PoolMode.NESTED_RETIRED_IN_EPHEMERAL,
+)
 
 
 def _is_grpc_internal(exc: BaseException) -> bool:
@@ -1212,10 +1378,15 @@ def _pairwise_filter(row):
 
     - D3 must be NONE when D2 is DEFAULT, EPHEMERAL, DURABLE, or NESTED_*
       (DURABLE manages its own LocalDiscovery internally)
-    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_JOINED
-    - D3 must be a LOCAL_* variant when D2 is DURABLE_JOINED
-      (DURABLE_JOINED exercises LocalDiscovery's owner/non-owner join
-      semantics, which LanDiscovery has no analogue for)
+    - D3 must NOT be NONE when D2 is HYBRID or DURABLE_BORROWED
+    - D3 must be one of _BORROWED_SUPPLY_FORMS when D2 is
+      DURABLE_BORROWED (that mode exercises LocalDiscovery's
+      owner/borrower semantics, which LanDiscovery has no analogue for;
+      the tuple is narrower than "every LOCAL_* member" — see its own
+      comment). Note the dual reading of D3: under DURABLE_BORROWED its
+      members denote supply forms of a *borrowed subscriber*, while
+      under HYBRID they denote supply forms of an *owning*
+      LocalDiscovery.
     - D4 must not be ASYNC_CM (pre-called async CM instances are not
       picklable inside WorkerProxy.__wool_reduce__; documented limitation,
       see #61)
@@ -1238,23 +1409,16 @@ def _pairwise_filter(row):
     if len(row) > 2:
         pool_mode = row[1]
         discovery = row[2]
-        needs_discovery = pool_mode in (
-            PoolMode.HYBRID,
-            PoolMode.DURABLE_JOINED,
-        )
-        forbids_discovery = pool_mode in (
-            PoolMode.DEFAULT,
-            PoolMode.EPHEMERAL,
-            PoolMode.DURABLE,
-            PoolMode.DURABLE_SHARED,
-            PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-            PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-        )
+        needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+        forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
         if needs_discovery and discovery is DiscoveryFactory.NONE:
             return False
         if forbids_discovery and discovery is not DiscoveryFactory.NONE:
             return False
-        if pool_mode is PoolMode.DURABLE_JOINED and discovery not in _LOCAL_FACTORIES:
+        if (
+            pool_mode is PoolMode.DURABLE_BORROWED
+            and discovery not in _BORROWED_SUPPLY_FORMS
+        ):
             return False
     if len(row) > 3:
         lb = row[3]
@@ -1356,76 +1520,32 @@ PAIRWISE_SCENARIOS = [
     )
 ]
 
-# allpairspy's greedy placement never selects LAN_ASYNC_CM under the
-# current filter constraints (LAN factories pair only with HYBRID), so
-# the generated array leaves the member entirely unexercised. Pin one
-# canonical scenario to guarantee deterministic coverage; the guard
-# test in test_integration.py fails loudly if another DiscoveryFactory
-# member ever drops out of the array.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LAN_ASYNC_CM,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
+#: The (pool mode, discovery) pairs allpairspy's greedy placement
+#: starves out of the generated array under the current filter
+#: constraints. Every one is legal — `scenarios_strategy` draws them and
+#: `_pairwise_filter` admits them — so leaving them to the generator
+#: means exercising them only by chance. Pinning one canonical scenario
+#: per pair makes the coverage deterministic; the agreement test in
+#: ``test_integration.py`` fails when Hypothesis draws a legal pair
+#: missing from both.
+_STARVED_PAIRS = (
+    # Two owning supply forms and both capacity members, which the
+    # generated array omits under HYBRID. The two capacity members size
+    # the registry the owner stamps: a small cap, and a cap exactly
+    # equal to the single spawned worker, which leaves it completely
+    # full yet dispatching.
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_DIRECT),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_ASYNC_CM),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_CAPACITY_BOUNDED),
+    (PoolMode.HYBRID, DiscoveryFactory.LOCAL_CAPACITY_EXACT),
+    # The borrowed supply forms, which the same members denote under
+    # DURABLE_BORROWED. Only the sync-CM form is starved.
+    (PoolMode.DURABLE_BORROWED, DiscoveryFactory.LOCAL_SYNC_CM),
 )
 
-# LOCAL_CAPACITY_BOUNDED pairs only with HYBRID (like the LAN factories),
-# so allpairspy's greedy placement can drop it from the generated array.
-# Pin one canonical scenario to guarantee the cover-all guard stays green
-# and the capacity-bounded LocalDiscovery gets a deterministic
-# dispatch-success case.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LOCAL_CAPACITY_BOUNDED,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
-)
-
-
-# LOCAL_CAPACITY_EXACT is likewise HYBRID-only, so pin one canonical
-# scenario: capacity == the single spawned worker exercises a completely
-# full self-describing segment end-to-end while still dispatching.
-PAIRWISE_SCENARIOS.append(
-    Scenario(
-        shape=RoutineShape.COROUTINE,
-        pool_mode=PoolMode.HYBRID,
-        discovery=DiscoveryFactory.LOCAL_CAPACITY_EXACT,
-        lb=LbFactory.CLASS_REF,
-        credential=CredentialType.INSECURE,
-        options=WorkerOptionsKind.DEFAULT,
-        timeout=TimeoutKind.NONE,
-        binding=RoutineBinding.MODULE_FUNCTION,
-        lazy=LazyMode.LAZY,
-        backpressure=BackpressureMode.NONE,
-        ctx_var_1=ContextVarPattern.NONE,
-        ctx_var_2=ContextVarPattern.NONE,
-        ctx_var_3=ContextVarPattern.NONE,
-        quorum=QuorumMode.DEFAULT,
-    )
+PAIRWISE_SCENARIOS.extend(
+    replace(default_scenario(pool_mode=pool_mode), discovery=discovery)
+    for pool_mode, discovery in _STARVED_PAIRS
 )
 
 
@@ -1435,21 +1555,11 @@ def scenarios_strategy(draw):
     shape = draw(st.sampled_from(RoutineShape))
     pool_mode = draw(st.sampled_from(PoolMode))
 
-    needs_discovery = pool_mode in (
-        PoolMode.HYBRID,
-        PoolMode.DURABLE_JOINED,
-    )
-    forbids_discovery = pool_mode in (
-        PoolMode.DEFAULT,
-        PoolMode.EPHEMERAL,
-        PoolMode.DURABLE,
-        PoolMode.DURABLE_SHARED,
-        PoolMode.NESTED_DEFAULT_IN_EPHEMERAL,
-        PoolMode.NESTED_EPHEMERAL_IN_EPHEMERAL,
-    )
+    needs_discovery = pool_mode in _DISCOVERY_REQUIRED_POOL_MODES
+    forbids_discovery = pool_mode in _DISCOVERY_FORBIDDEN_POOL_MODES
 
-    if pool_mode is PoolMode.DURABLE_JOINED:
-        discovery = draw(st.sampled_from(list(_LOCAL_FACTORIES)))
+    if pool_mode is PoolMode.DURABLE_BORROWED:
+        discovery = draw(st.sampled_from(list(_BORROWED_SUPPLY_FORMS)))
     elif needs_discovery:
         discovery = draw(
             st.sampled_from(
@@ -1581,28 +1691,108 @@ def credentials_map(test_certificates):
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _clear_channel_pool():
-    """Finalize the module-level gRPC channel pool on the loop that used it.
+async def _channel_pool_gate(request):
+    """Fail a test that leaves a gRPC channel cached on its loop.
 
-    Prompt finalization only; the pool rebinds and drops orphans on its
-    own, so this is not required for correctness.
+    Every construct that opens a channel — a pool, a proxy, a bare
+    `WorkerConnection` — owns closing it, so a test that ends with
+    channels still cached on its loop has stranded one, for a later
+    test's pool operation to report (see
+    `~wool.runtime.resourcepool.ResourcePool`). The gate makes that a
+    failure of the test that caused it rather than a warning attributed
+    to whichever test runs next, and it stands down for a test that
+    already failed in setup or in its body, whose leftovers are a
+    symptom rather than a second finding. Both pools are read: a hold
+    outlives the channels it kept warm, so a test that strands one
+    passes a channel-only check. The clearing itself belongs to the root
+    ``_clear_channel_pool`` fixture, whose teardown runs after this one
+    and covers holds as well as channels, so one leak does not cascade
+    into the rest of the suite.
     """
     yield
-    import wool.runtime.worker.connection as _conn
+    reports = [
+        getattr(request.node, f"rep_{phase}", None) for phase in ("setup", "call")
+    ]
+    if all(report is not None and report.passed for report in reports):
+        await poll_until_channel_pool_settles()
+        # The holds too: a test that strands a hold with no channel
+        # behind it leaves counters the channel read cannot show, and
+        # the discard would report it against whichever test closed the
+        # loop next.
+        await poll_until_channel_pool_settles(get=channel_pool_hold_stats)
 
-    await _conn.clear_channel_pool()
+
+@pytest.fixture(autouse=True)
+def subscriber_pool():
+    """Install a subscriber pool for the test and yield it.
+
+    Mirrors the discovery unit tests' fixture of the same name (see
+    ``tests/runtime/discovery/conftest.py``), whose docstring gives the
+    reason it is synchronous. Constructing a `LocalDiscovery.Subscriber`
+    installs a pool in the calling context, and this fixture scopes it
+    to one test.
+    """
+    token = __subscriber_pool__.set(None)
+    try:
+        yield install_subscriber_pool()
+    finally:
+        __subscriber_pool__.reset(token)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_subscriber_pool(subscriber_pool):
+    """Finalize the subscriber pool on the loop that used it.
+
+    The clear runs on the owning loop, the only place the pool's
+    finalizers can run; anything a test left cached would otherwise be
+    discarded and reported once this loop has closed. It clears the
+    object `subscriber_pool` yielded rather than whatever
+    ``__subscriber_pool__`` reads back here: an async fixture's teardown
+    runs in a task with a context copy of its own, where the test's own
+    assignments are not visible.
+    """
+    yield
+    await subscriber_pool.clear()
 
 
 # Integration tests rely on pytest-asyncio's Task-per-test scoping
-# for ContextVar isolation: each async test runs inside an
+# for wool.ContextVar isolation: each async test runs inside an
 # asyncio.Task whose ``contextvars.Context`` is a copy, so
 # wool.ContextVar mutations stay scoped to that copy and don't leak
 # to the next test. Sync integration helpers run in the pytest main
-# Chain — if they ever mutate routine-level vars, add an explicit
-# per-test teardown at that site rather than reviving a global
-# autouse cleanup. (The previous sync ``_clear_proxy_context``
-# autouse fixture mutated the pytest main Chain, which async test
-# tasks never observe; it was load-bearing in appearance only.)
+# Chain — if they ever mutate routine-level wool.ContextVar values,
+# add an explicit per-test teardown at that site. A stdlib context var
+# set in a sync fixture remains visible to the test task (see
+# `subscriber_pool`).
+
+
+async def _stop_all(workers) -> None:
+    """Stop every worker, kill what will not stop, and re-raise the first failure.
+
+    Shared by the fixtures that own worker processes. Every worker is
+    given its stop even when an earlier one raised: a raise that ends
+    the loop would leave the rest running for the remainder of the
+    session. A worker that was never started is the one expected
+    refusal and is passed over; any other failure is recorded after its
+    process has been killed, so a teardown that fails cannot leak a
+    worker either, and the first one is re-raised once every worker has
+    been dealt with — the shape `background_loops` uses in the unit
+    suite.
+    """
+    failures: list[BaseException] = []
+    for worker in workers:
+        pid = worker.metadata.pid if worker.metadata is not None else None
+        try:
+            await worker.stop()
+        except RuntimeError as error:
+            if "has not been started" not in str(error):
+                failures.append(error)
+                _ensure_killed(pid)
+        except Exception as error:
+            failures.append(error)
+            _ensure_killed(pid)
+    if failures:
+        raise failures[0]
 
 
 @pytest_asyncio.fixture
@@ -1623,8 +1813,7 @@ async def started_worker():
         return worker
 
     yield start
-    for worker in workers:
-        await worker.stop()
+    await _stop_all(workers)
 
 
 @pytest_asyncio.fixture
@@ -1670,12 +1859,8 @@ async def worker_update_pool(request) -> AsyncIterator[tuple]:
                     with suppress(KeyError):
                         await publisher.publish("worker-dropped", worker_a.metadata)
     finally:
-        # ``LocalWorker.stop`` raises on an already-stopped worker, so
-        # the teardown absorbs that here rather than making every test
-        # carry a "did I stop it?" flag.
-        for worker in (worker_b, worker_a):
-            with suppress(RuntimeError):
-                await worker.stop()
+        # Stopping a worker a test already stopped -- see `_stop_all`.
+        await _stop_all((worker_b, worker_a))
 
 
 @pytest.fixture
@@ -1692,6 +1877,28 @@ def retry_grpc_internal():
     PollerCompletionQueue thundering-herd race. All other exceptions
     propagate immediately. If retries are exhausted the last
     exception propagates as a real test failure.
+
+    .. rubric:: Implementation notes
+
+    This stands in for the Python Test Guide's ``_KnownBug`` dataclass
+    and ``xfail_known_bugs`` fixture, deliberately and with two
+    departures: it carries no ``match`` predicate, so it applies to
+    every scenario rather than the ones a bug is known to reach, and it
+    re-raises on exhaustion instead of calling ``pytest.xfail``, so an
+    exhausted retry is a failure rather than an expected one. Both
+    follow from the bug it absorbs — the grpcio PollerCompletionQueue
+    thundering-herd race is scenario-independent, and a run that cannot
+    get past it in three attempts is worth failing on. Reshaping this
+    into the structured form is a larger change than the suite that
+    uses it.
+
+    One pairwise failure remains uncharacterised: a single
+    ``LOCAL_CAPACITY_BOUNDED`` combination failed once in five full runs
+    and reproduced on none of them. Only ``StatusCode.INTERNAL`` is
+    absorbed here, so a transient ``UNAVAILABLE`` or a
+    `DiscoveryCapacityExhausted` from the tightest-capacity scenario
+    would fail outright. It wants a traceback off CI before it becomes
+    a structured entry rather than a guess.
     """
 
     async def run(body):
@@ -1714,6 +1921,51 @@ def retry_grpc_internal():
                 raise
 
     return run
+
+
+#: The prefix a worker's log record opens with -- see
+#: `wool.runtime.worker.process.WorkerProcess.run` for the format.
+_WORKER_RECORD = re.compile(r"^\S+ \S+ - WORKER\[(\d+)\] - ")
+
+
+@pytest.fixture
+def worker_log(capfd, request):
+    """Read what the spawned worker processes wrote to stderr.
+
+    Returns a callable ``read(pid=None)`` that drains pytest's
+    file-descriptor capture and returns it as text, narrowed to the
+    records one worker emitted when a pid is given: a worker configures
+    logging with a ``WORKER[<pid>]`` prefix on the stderr it inherits
+    (see `wool.runtime.worker.process.WorkerProcess.run`), so a record's
+    continuation lines — a traceback's, say — are kept with the prefixed
+    line that opened them, and a line that opens another worker's record
+    ends the one being kept. Only fd capture sees that stream: ``caplog``
+    never does, and under ``-s`` there is no capture at all and every
+    read returns the empty string. A read drains what has accumulated so
+    far, so a caller reads once — after the worker has exited or after
+    awaiting the RPC whose log it is asserting on — and keeps the text.
+    """
+
+    def read(pid=None):
+        captured = capfd.readouterr().err
+        if pid is None:
+            return captured
+        lines = []
+        keeping = False
+        for line in captured.splitlines(keepends=True):
+            record = _WORKER_RECORD.match(line)
+            if record is not None:
+                keeping = int(record.group(1)) == pid
+            if keeping:
+                lines.append(line)
+        return "".join(lines)
+
+    # Under ``-s`` there is no capture and every read is empty, which
+    # would fail an assertion anchored on a worker's output for a reason
+    # that has nothing to do with the behaviour under test -- and ``-s``
+    # is what someone reaches for to debug these very tests.
+    read.capturing = request.config.getoption("capture") != "no"
+    return read
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1797,3 +2049,28 @@ def release_subprocess(proc: subprocess.Popen | None) -> None:
         if stream is not None:
             with suppress(Exception):
                 stream.close()
+
+
+@pytest.fixture
+def namespaces():
+    """Mint discovery namespaces and remove their directories afterwards.
+
+    A namespace whose owner is killed keeps its directory by contract —
+    nothing survives a SIGKILL to reclaim it — so every test that kills
+    an owner leaves one behind. Minting through here keeps the
+    descriptive prefix a failure message needs while making the cleanup
+    one decision rather than one per test. It removes directories only;
+    the residue *assertions* stay in the tests that make them, since a
+    fixture asserting them would mask the leaks they pin.
+    """
+    minted: list[str] = []
+
+    def mint(prefix: str) -> str:
+        namespace = f"{prefix}-{uuid.uuid4().hex[:12]}"
+        minted.append(namespace)
+        return namespace
+
+    yield mint
+
+    for namespace in minted:
+        shutil.rmtree(namespace_directory(namespace), ignore_errors=True)
