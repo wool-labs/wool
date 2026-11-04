@@ -323,7 +323,7 @@ A `DiscoveryEvent` pairs a type — one of `worker-added`, `worker-dropped`, or 
 
 Wool ships with two discovery protocols:
 
-- **`LocalDiscovery`** — shared-memory IPC for single-machine pools, and the default when no discovery is specified. A namespace's registry has exactly one owner, the entered `LocalDiscovery` instance that created it, and publishers and subscribers borrow it. See [Worker discovery](src/wool/runtime/discovery/README.md) and the `LocalDiscovery` docstring for ownership, borrowing and orphaning.
+- **`LocalDiscovery`** — file-backed IPC for single-machine pools, and the default when no discovery is specified. A namespace's registry has exactly one owner, the entered `LocalDiscovery` instance holding its claim, and publishers and subscribers borrow it. See [Worker discovery](src/wool/runtime/discovery/README.md) and the `LocalDiscovery` docstring for ownership, borrowing and orphaning.
 
 - **`LanDiscovery`** — Zeroconf DNS-SD (`_wool._tcp.local.`) for network-wide discovery. Publishers register, update, and unregister `ServiceInfo` records via `AsyncZeroconf`. Subscribers use `AsyncServiceBrowser` to listen for service changes and convert Zeroconf callbacks into Wool `DiscoveryEvent`s. No central coordinator or shared state is required.
 

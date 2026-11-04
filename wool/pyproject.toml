@@ -21,12 +21,11 @@ dependencies = [
     "cloudpickle",
     "grpcio>=1.76.0,<2",
     "packaging",
-    "portalocker",
     "protobuf>=6.31.1,<7",
     "shortuuid",
     "tblib",
     "typing-extensions",
-    "watchdog<7",
+    "watchdog>=6,<8",
     "zeroconf",
 ]
 description = "A distributed Python runtime"

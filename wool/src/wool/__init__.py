@@ -30,6 +30,7 @@ from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.base import PredicateFunction
 from wool.runtime.discovery.exceptions import DiscoveryBlockExhausted
 from wool.runtime.discovery.exceptions import DiscoveryCapacityExhausted
+from wool.runtime.discovery.exceptions import DiscoveryNamespaceContended
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceInUse
 from wool.runtime.discovery.exceptions import DiscoveryNamespaceNotFound
 from wool.runtime.discovery.exceptions import DiscoveryWorkerNotFound
@@ -134,6 +135,7 @@ __all__ = [
     "DiscoveryEvent",
     "DiscoveryEventType",
     "DiscoveryLike",
+    "DiscoveryNamespaceContended",
     "DiscoveryNamespaceInUse",
     "DiscoveryNamespaceNotFound",
     "DiscoveryPublisherLike",

@@ -4,7 +4,6 @@ import pytest
 import pytest_asyncio
 
 from wool.runtime.discovery import __subscriber_pool__
-from wool.runtime.discovery.pool import _subscriber_factories
 from wool.runtime.discovery.pool import install_subscriber_pool
 
 
@@ -23,7 +22,6 @@ def subscriber_pool():
         yield install_subscriber_pool()
     finally:
         __subscriber_pool__.reset(token)
-        _subscriber_factories.clear()
 
 
 @pytest_asyncio.fixture(autouse=True)

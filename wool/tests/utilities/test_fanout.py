@@ -126,15 +126,16 @@ class TestFanout:
 
     @pytest.mark.asyncio
     async def test_cleanup_with_failing_aclose(self):
-        """Test cleanup swallows exceptions from the source iterator.
+        """Test cleanup reports a failure to close the shared iterator.
 
         Given:
-            A Fanout whose source raises during aclose.
+            A Fanout whose source raises while closing.
         When:
             cleanup is called.
         Then:
-            It should swallow the exception and still signal
-            consumers with a sentinel.
+            It should raise that failure, having still signalled every
+            consumer, so the pool retiring the resource can name what
+            failed to close rather than losing it.
         """
 
         # Arrange
@@ -153,12 +154,127 @@ class TestFanout:
         consumer = fanout.consumer()
         await anext(consumer)  # initialise the iterator
 
+        # Act & assert
+        with pytest.raises(RuntimeError, match="aclose failed"):
+            await fanout.cleanup()
+
+        # Assert — the consumer is signalled despite the failure
+        with pytest.raises(StopAsyncIteration):
+            await anext(consumer)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_with_aiter_only_source(self):
+        """Test cleanup closes the stream behind an __aiter__-only source.
+
+        Given:
+            A Fanout over an object that has __aiter__ and no aclose,
+            which is the shape a pooled discovery subscriber has
+        When:
+            cleanup is called after the iterator has been initialised
+        Then:
+            It should run the underlying stream's finally, rather than
+            leaving its resources to be released whenever the generator
+            is collected.
+        """
+        # Arrange
+        closed = []
+
+        class _SubscriberLike:
+            def __aiter__(self):
+                return self._stream()
+
+            async def _stream(self):
+                try:
+                    while True:
+                        yield "item"
+                finally:
+                    closed.append(True)
+
+        fanout = Fanout(_SubscriberLike())
+        consumer = fanout.consumer()
+        await anext(consumer)  # initialise the iterator
+
         # Act
         await fanout.cleanup()
 
-        # Assert — consumer is signalled despite the exception
-        with pytest.raises(StopAsyncIteration):
-            await anext(consumer)
+        # Assert
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_should_close_a_conforming_non_generator_source(self):
+        """Test cleanup closes a source that is not an async generator.
+
+        Given:
+            A Fanout over a class-based async iterator that implements
+            aclose as a coroutine function but not the rest of the
+            async generator protocol, which is a shape the subscriber
+            contract admits
+        When:
+            cleanup is called after the iterator has been initialised
+        Then:
+            It should await that aclose, rather than leaving the source
+            open on the grounds that it is not a generator.
+        """
+        # Arrange
+        closed = []
+
+        class _Iterator:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return "item"
+
+            async def aclose(self):
+                closed.append(True)
+
+        fanout = Fanout(_Iterator())
+        consumer = fanout.consumer()
+        await anext(consumer)  # initialise the iterator
+
+        # Act
+        await fanout.cleanup()
+
+        # Assert
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_should_not_await_a_synchronous_aclose(self):
+        """Test cleanup leaves a source's synchronous aclose alone.
+
+        Given:
+            A Fanout over a class-based async iterator whose aclose is
+            an ordinary function, which AsyncIterable's guarantee of
+            __aiter__ and nothing else leaves possible
+        When:
+            cleanup is called after the iterator has been initialised
+        Then:
+            It should neither call it nor raise, since awaiting a
+            non-awaitable would reach the pool's finalizer as a close
+            failure against the resource being retired.
+        """
+        # Arrange
+        called = []
+
+        class _Iterator:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return "item"
+
+            def aclose(self):
+                called.append(True)
+
+        fanout = Fanout(_Iterator())
+        consumer = fanout.consumer()
+        await anext(consumer)  # initialise the iterator
+
+        # Act
+        await fanout.cleanup()
+
+        # Assert
+        assert called == []
 
 
 class TestFanoutConsumer:
@@ -278,50 +394,99 @@ class TestFanoutConsumer:
         with pytest.raises(StopAsyncIteration):
             await anext(consumer)
 
-    def test_enqueue_with_direct_item(self):
-        """Test enqueue pushes an item into the consumer's queue.
+    @pytest.mark.asyncio
+    async def test_consumer_should_yield_primed_items_when_primed(self):
+        """Test a primed consumer yields what it was primed with.
 
         Given:
-            A FanoutConsumer instance.
+            A fanout over a source that yields nothing.
         When:
-            enqueue is called with an item.
+            A consumer is created with primed items and pulled.
         Then:
-            It should be retrievable on the next pull.
+            It should yield them in order, since priming is how a
+            caller hands a joining consumer state the shared source
+            will not replay.
         """
         # Arrange
         fanout = Fanout(_Source())
-        consumer = fanout.consumer()
 
         # Act
-        consumer.enqueue("injected")
+        consumer = fanout.consumer(["first", "second"])
 
-        # Assert — item is in the queue (verified via queue size)
-        assert not consumer._queue.empty()
+        # Assert
+        assert await anext(consumer) == "first"
+        assert await anext(consumer) == "second"
 
     @pytest.mark.asyncio
-    async def test_enqueue_with_pull_after_inject(self):
-        """Test enqueued items are returned before source items.
+    async def test_consumer_should_yield_primed_items_before_source_items(self):
+        """Test priming puts items ahead of everything the source sends.
 
         Given:
-            A FanoutConsumer with an enqueued item and a source
-            that also yields items.
+            A fanout over a source that yields an item of its own.
         When:
-            anext is called.
+            A consumer is created with a primed item and pulled twice.
         Then:
-            It should return the enqueued item first.
+            It should yield the primed item first — the invariant its
+            caller depends on, since a replayed state that arrived
+            behind a source delta could contradict it.
         """
         # Arrange
         fanout = Fanout(_Source("from-source"))
-        consumer = fanout.consumer()
-        consumer.enqueue("injected")
 
         # Act
+        consumer = fanout.consumer(["injected"])
         first = await anext(consumer)
         second = await anext(consumer)
 
         # Assert
         assert first == "injected"
         assert second == "from-source"
+
+    @pytest.mark.asyncio
+    async def test_consumer_should_yield_primed_items_before_the_source_end(self):
+        """Test priming outranks how the source ended.
+
+        Given:
+            A fanout whose source has already been exhausted and
+            cleaned up, so every consumer is owed its end.
+        When:
+            A consumer is created with primed items and pulled.
+        Then:
+            It should yield them before reporting the end, since a
+            consumer joining a finished subscription is still owed the
+            state its caller replayed to it.
+        """
+        # Arrange
+        fanout = Fanout(_Source())
+        exhausted = fanout.consumer()
+        with pytest.raises(StopAsyncIteration):
+            await anext(exhausted)
+        await fanout.cleanup()
+
+        # Act
+        consumer = fanout.consumer(["late"])
+
+        # Assert
+        assert await anext(consumer) == "late"
+        with pytest.raises(StopAsyncIteration):
+            await anext(consumer)
+
+    @pytest.mark.asyncio
+    async def test___init___should_raise_when_the_source_is_not_iterable(self):
+        """Test a source that cannot be iterated is refused at construction.
+
+        Given:
+            An object that is not an async iterable.
+        When:
+            A Fanout is constructed over it.
+        Then:
+            It should raise TypeError from that construction, rather
+            than from inside the first consumer's pull several frames
+            away.
+        """
+        # Act & assert
+        with pytest.raises(TypeError, match="Expected an async iterable"):
+            Fanout(object())  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.asyncio
     async def test___anext___with_late_registered_consumer(self):
@@ -424,3 +589,196 @@ class TestFanoutConsumer:
 
         # Assert — both received StopAsyncIteration
         assert all(isinstance(r, StopAsyncIteration) for r in results)
+
+    @pytest.mark.asyncio
+    async def test___anext___with_failing_source(self):
+        """Test a source's failure reaches every consumer.
+
+        Given:
+            Two consumers sharing a source that raises part way
+            through, with the first consumer having already pulled the
+            item before it
+        When:
+            Each consumer pulls again
+        Then:
+            Both should raise that failure, rather than the consumer
+            that was not pulling ending as though the source had simply
+            run out.
+        """
+
+        # Arrange
+        class _FailingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield "a"
+                raise RuntimeError("source failed")
+
+        fanout = Fanout(_FailingSource())
+        consumer_a = fanout.consumer()
+        consumer_b = fanout.consumer()
+        assert await anext(consumer_a) == "a"
+        # Drain the item the pull above fanned out, so the next pull
+        # below reaches the source rather than this consumer's queue.
+        assert await anext(consumer_b) == "a"
+
+        # Act
+        with pytest.raises(RuntimeError, match="source failed") as first:
+            await anext(consumer_a)
+
+        # Assert — the consumer that never pulled the source gets the
+        # same failure, not a clean end.
+        with pytest.raises(RuntimeError, match="source failed") as second:
+            await anext(consumer_b)
+        assert second.value is first.value
+
+    @pytest.mark.asyncio
+    async def test___anext___with_consumer_joining_after_failure(self):
+        """Test a consumer that joins a failed fanout raises its failure.
+
+        Given:
+            A Fanout whose source has already raised
+        When:
+            A consumer created after that failure pulls
+        Then:
+            It should raise the recorded failure, rather than binding a
+            fresh iterator over a source that is already finished.
+        """
+
+        # Arrange
+        class _FailingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                raise RuntimeError("source failed")
+                yield  # pragma: no cover — makes this an async generator
+
+        fanout = Fanout(_FailingSource())
+        with pytest.raises(RuntimeError, match="source failed"):
+            await anext(fanout.consumer())
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="source failed"):
+            await anext(fanout.consumer())
+
+    @pytest.mark.asyncio
+    async def test___anext___with_cancelled_consumer(self):
+        """Test one consumer's cancellation does not end the others.
+
+        Given:
+            Two consumers sharing a source that suspends before its
+            first item, and a pull by the first that is cancelled while
+            it waits
+        When:
+            The source releases its item and the second consumer pulls
+        Then:
+            It should receive that item and the fanout should hold no
+            failure, the cancellation having reached only the consumer
+            that was cancelled rather than the source they share.
+        """
+
+        # Arrange
+        release = asyncio.Event()
+
+        class _SuspendingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                await release.wait()
+                yield "a"
+
+        fanout = Fanout(_SuspendingSource())
+        consumer_a = fanout.consumer()
+        consumer_b = fanout.consumer()
+        pulling = asyncio.ensure_future(anext(consumer_a))
+        await asyncio.sleep(0)
+
+        # Act
+        pulling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pulling
+        release.set()
+
+        # Assert — the shared source survived, so the survivor gets the
+        # item it was waiting for rather than the end of the stream.
+        assert await anext(consumer_b) == "a"
+        assert fanout._failure is None
+
+    @pytest.mark.asyncio
+    async def test___anext___with_cancelled_consumer_still_delivers_to_it(self):
+        """Test a cancelled consumer keeps its place in the stream.
+
+        Given:
+            Two consumers sharing a source that suspends, and a pull by
+            the first that is cancelled while it waits
+        When:
+            The source releases its item and the cancelled consumer
+            pulls again
+        Then:
+            It should receive the item its cancelled pull was fetching,
+            the pull having been the container's rather than its own.
+        """
+        # Arrange
+        release = asyncio.Event()
+
+        class _SuspendingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                await release.wait()
+                yield "a"
+                yield "b"
+
+        fanout = Fanout(_SuspendingSource())
+        consumer_a = fanout.consumer()
+        pulling = asyncio.ensure_future(anext(consumer_a))
+        await asyncio.sleep(0)
+
+        # Act
+        pulling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pulling
+        release.set()
+
+        # Assert
+        assert await anext(consumer_a) == "a"
+
+    @pytest.mark.asyncio
+    async def test___anext___with_concurrent_consumers_pulls_once(self):
+        """Test concurrent consumers share a single pull of the source.
+
+        Given:
+            A source counting how many times it is advanced, and three
+            consumers of one fanout
+        When:
+            All three pull concurrently
+        Then:
+            It should advance the source once and hand that one item to
+            every consumer.
+        """
+        # Arrange
+        advances = []
+
+        class _CountingSource:
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                while True:
+                    advances.append(True)
+                    await asyncio.sleep(0)
+                    yield len(advances)
+
+        fanout = Fanout(_CountingSource())
+        consumers = [fanout.consumer() for _ in range(3)]
+
+        # Act
+        items = await asyncio.gather(*(anext(c) for c in consumers))
+
+        # Assert
+        assert items == [1, 1, 1]
+        assert len(advances) == 1
