@@ -14,6 +14,7 @@ import uuid
 import warnings
 from contextlib import asynccontextmanager
 from typing import Any
+from typing import Callable
 from typing import Coroutine
 from typing import Final
 from typing import cast
@@ -27,7 +28,9 @@ from wool.runtime.discovery.base import DiscoveryLike
 from wool.runtime.discovery.base import DiscoveryPublisherLike
 from wool.runtime.discovery.base import DiscoverySubscriberLike
 from wool.runtime.discovery.local import LocalDiscovery
+from wool.runtime.routine.wrapper import dispatch_through
 from wool.runtime.typing import Factory
+from wool.runtime.typing import R
 from wool.runtime.typing import Undefined
 from wool.runtime.typing import UndefinedType
 from wool.runtime.typing import resolved
@@ -937,6 +940,75 @@ class WorkerPool:
             await self._proxy_context.__aexit__(*args)
         finally:
             self._proxy = None
+
+    # public
+    def dispatch(self, routine: Callable[..., R], /, *args, **kwargs) -> R:
+        """Dispatch ``routine`` through this pool instead of the ambient one.
+
+        A `wool.routine` call dispatches through whichever pool is
+        active in the caller's context. This routes one call through
+        *this* pool whatever that context holds, and is otherwise
+        indistinguishable from calling the routine directly: the return
+        value has the routine's own shape — a coroutine to await for a
+        coroutine routine, an async generator to iterate for an async
+        generator routine, supporting the full
+        ``asend``/``athrow``/``aclose`` protocol — and the routine runs
+        under the caller's chain exactly as an ambient call would.
+
+        One routine goes to one worker, selected by this pool's load
+        balancer — a single dispatch, not a fan-out across the pool.
+
+        The override reaches the routine's nested calls too: the task
+        carries this pool's proxy, so a `wool.routine` the worker calls
+        in turn routes through this pool rather than the caller's.
+
+        ``routine`` is positional-only and no keyword is reserved, so
+        every keyword reaches the routine — including one named
+        ``routine`` or ``pool``.
+
+        A bound method or classmethod may be dispatched as it stands;
+        its receiver travels with it, so ``obj.method`` takes the same
+        arguments here as it does when called.
+
+        Worker selection, the quorum gate, lazy startup, and every
+        failure mode a dispatch can report are `WorkerProxy.dispatch`'s
+        — see it for what the routing guarantees and what it raises.
+
+        :param routine:
+            The `wool.routine`-decorated function to dispatch.
+        :param args:
+            Positional arguments for ``routine``.
+        :param kwargs:
+            Keyword arguments for ``routine``.
+        :returns:
+            Whatever calling ``routine`` returns — a coroutine or an
+            async generator — routed through this pool.
+        :raises TypeError:
+            If ``routine`` is not `wool.routine`-decorated. An
+            undecorated callable would run in the caller's own process,
+            which is the opposite of what this call asks for. Raised by
+            `~wool.runtime.routine.wrapper.dispatch_through`, which this
+            forwards to.
+        :raises RuntimeError:
+            If the pool has not been entered. A pool prepares its
+            dispatch proxy at context entry and releases it at exit, so
+            outside that scope there is nothing to route through.
+
+        **Dispatch to a pool other than the ambient one:**
+
+        .. code-block:: python
+
+            async with wool.WorkerPool(spawn=4) as gpu:
+                async with wool.WorkerPool(spawn=16):
+                    # Routes through `gpu`, not the inner pool.
+                    result = await gpu.dispatch(train, dataset)
+        """
+        if self._proxy is None:
+            raise RuntimeError(
+                "WorkerPool is not entered; enter the pool's context before "
+                "dispatching through it"
+            )
+        return dispatch_through(self._proxy, routine, *args, **kwargs)
 
     @asynccontextmanager
     async def _worker_context(

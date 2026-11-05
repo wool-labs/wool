@@ -5,11 +5,14 @@ from __future__ import annotations
 from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
 from enum import Enum
+from typing import Any
 from typing import AsyncContextManager
+from typing import AsyncGenerator
 from typing import AsyncIterator
 from typing import Awaitable
 from typing import Callable
 from typing import ContextManager
+from typing import Coroutine
 from typing import Final
 from typing import TypeAlias
 from typing import TypeVar
@@ -22,6 +25,9 @@ W = TypeVar("W", bound=Callable)
 T_CO: Final = TypeVar("T_CO", covariant=True)
 T = TypeVar("T")
 U = TypeVar("U")
+#: What calling a `wool.routine` returns: a coroutine to await, or an
+#: async generator to iterate.
+R = TypeVar("R", bound=Coroutine[Any, Any, Any] | AsyncGenerator[Any, Any])
 Wrapper = Callable[[F], W]
 PassthroughWrapper = Callable[[F], F]
 

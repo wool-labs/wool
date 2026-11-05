@@ -221,6 +221,35 @@ def routine(fn: C) -> C:
             async with wool.WorkerPool():
                 async for value in fibonacci_series(10):
                     print(value)  # 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
+
+    .. rubric:: Implementation notes
+
+    The returned wrapper carries a ``__wool_dispatch__`` attribute
+    holding ``(entrypoint, lineno)``, where the entrypoint is the
+    dispatch function matching this routine's call shape — one
+    returning a coroutine, or one returning an async generator. It is
+    the pair `dispatch_through` needs to route this routine through a
+    proxy its caller names rather than the ambient one. Nothing in the
+    ambient dispatch path consults it; a routine call routes on the
+    `~wool.runtime.routine.task.do_dispatch` flag. Its absence is also
+    what marks a callable as undispatchable, which an explicit dispatch
+    needs because it is handed a callable rather than invoking one: an
+    undecorated coroutine function is callable and awaitable, so
+    without the attribute it would run in the caller's own process
+    while the call reported a dispatch.
+
+    A tuple rather than a bound hook. The attribute travels in the
+    wrapper's ``__dict__``, which cloudpickle ships for the shapes that
+    serialize by value (a closure, a ``classmethod``'s function), and a
+    closure over the wrapper would carry its own code object into every
+    such dispatch. Both members pickle to almost nothing: the
+    entrypoint is importable and ``lineno`` is an ``int``. The shapes
+    that serialize by reference carry no ``__dict__`` at all, so they
+    pay nothing either way.
+
+    A bound ``classmethod`` or ``staticmethod`` forwards attribute
+    lookup to the underlying function, so the decorator ordering
+    documented above carries the attribute through.
     """
     if isinstance(fn, (classmethod, staticmethod)):
         raise ValueError(
@@ -255,6 +284,9 @@ def routine(fn: C) -> C:
                 stream = _stream(fn, *args, **kwargs)
                 assert isasyncgen(stream)
 
+            # Relayed here rather than through `_dispatch_stream`, whose
+            # loop this repeats — see that function for why the three
+            # relays in this module cannot be folded into one.
             try:
                 sent = None
                 result = await stream.__anext__()
@@ -276,6 +308,10 @@ def routine(fn: C) -> C:
             finally:
                 await stream.aclose()
 
+        # Set rather than assigned: `functools.wraps` returns a typed
+        # shim that declares no such attribute.
+        setattr(async_generator_wrapper, "__wool_dispatch__", (_dispatch_stream, lineno))
+
         return cast(C, async_generator_wrapper)
 
     else:
@@ -285,7 +321,7 @@ def routine(fn: C) -> C:
             if do_dispatch():
                 proxy = wool.__proxy__.get()
                 assert proxy
-                stream = await _dispatch(
+                return await _dispatch_coroutine(
                     proxy,
                     coroutine_wrapper.__module__,
                     coroutine_wrapper.__qualname__,
@@ -294,11 +330,146 @@ def routine(fn: C) -> C:
                     *args,
                     **kwargs,
                 )
-                return await _stream_to_coroutine(stream)
             else:
                 return await _execute(fn, *args, **kwargs)
 
+        # Set rather than assigned: `functools.wraps` returns a typed
+        # shim that declares no such attribute.
+        setattr(coroutine_wrapper, "__wool_dispatch__", (_dispatch_coroutine, lineno))
+
         return cast(C, coroutine_wrapper)
+
+
+def dispatch_through(proxy: WorkerProxy, routine: Callable, /, *args, **kwargs):
+    """Dispatch ``routine`` through ``proxy`` rather than the ambient one.
+
+    The entry point behind `wool.WorkerPool.dispatch`, which owns the
+    user-facing contract. A routine resolves its proxy from
+    `wool.__proxy__` when called; this routes one call through the proxy
+    its caller names instead, by handing that proxy to the same dispatch
+    path the routine would have taken, so an explicit dispatch and an
+    ambient call differ in nothing but which proxy serves them.
+
+    ``proxy`` and ``routine`` are positional-only, so no keyword this
+    forwards is shadowed by the signature.
+
+    :param proxy:
+        The `WorkerProxy` to route through.
+    :param routine:
+        The `routine`-decorated function to dispatch. A bound method or
+        classmethod is accepted and carries its receiver.
+    :returns:
+        Whatever calling ``routine`` returns — a coroutine for a
+        coroutine routine, an async generator for an async generator
+        routine.
+    :raises TypeError:
+        If ``routine`` carries no ``__wool_dispatch__``, which is to say
+        it is not `routine`-decorated. See `routine` for what the
+        attribute holds and why its absence is the marker.
+
+    .. rubric:: Implementation notes
+
+    A bound callable carries its receiver out of band, where an ambient
+    call carries it in the argument list: calling ``obj.method(a, b)``
+    invokes the decorator's wrapper as ``wrapper(obj, a, b)``. Unbinding
+    restores that shape, which matters because `_dispatch` drops a
+    leading argument for anything carrying ``__self__`` — a branch the
+    ambient path keeps dead by only ever handing it the plain wrapper.
+    Passing a bound callable straight through would both trip that
+    branch and ship the receiver twice.
+    """
+    spec = getattr(routine, "__wool_dispatch__", None)
+    if spec is None:
+        raise TypeError(
+            f"Expected a @wool.routine-decorated callable, got "
+            f"{getattr(routine, '__qualname__', routine)!r}; an "
+            "undecorated callable cannot be dispatched"
+        )
+    # Read through `getattr`: `Callable` declares neither member, and
+    # anything carrying a `__self__` carries a `__func__` beside it.
+    if (receiver := getattr(routine, "__self__", None)) is not None:
+        args = (receiver, *args)
+        routine = getattr(routine, "__func__")
+    entrypoint, lineno = spec
+    return entrypoint(
+        proxy,
+        routine.__module__,
+        routine.__qualname__,
+        lineno,
+        routine,
+        *args,
+        **kwargs,
+    )
+
+
+async def _dispatch_coroutine(
+    proxy: WorkerProxy,
+    module: str,
+    qualname: str,
+    lineno: int,
+    function: Callable[..., Coroutine | AsyncGenerator],
+    *args,
+    **kwargs,
+):
+    """Dispatch a coroutine routine and take its single result frame."""
+    stream = await _dispatch(proxy, module, qualname, lineno, function, *args, **kwargs)
+    return await _stream_to_coroutine(stream)
+
+
+async def _dispatch_stream(
+    proxy: WorkerProxy,
+    module: str,
+    qualname: str,
+    lineno: int,
+    function: Callable[..., Coroutine | AsyncGenerator],
+    *args,
+    **kwargs,
+):
+    """Dispatch an async generator routine and relay its result stream.
+
+    Dispatches nothing until first iteration, which is where a routine
+    call dispatches too.
+
+    .. rubric:: Implementation notes
+
+    This module relays the async-generator protocol in three places —
+    here, in `routine`'s async generator wrapper, and in `_stream` — and
+    they cannot be folded into one. Python has no asynchronous
+    ``yield from``, so an async generator cannot delegate its protocol
+    to another without repeating the loop, and the wrapper has to be an
+    async generator function in its own right: `Task.callable` is the
+    wrapper, and the worker decides between streaming and unary dispatch
+    by asking `inspect.isasyncgenfunction` about it.
+
+    This loop and the wrapper's are identical; `_stream`'s is not. That
+    one scopes every step in ``do_dispatch(True)`` so a routine the
+    user's body calls dispatches rather than running inline, and the
+    scope has to sit inside each step rather than around the loop: an
+    async generator has no context of its own, so a ``with`` spanning
+    the ``yield`` would leak the flag to the consumer and reset its
+    token in whichever context happened to drive the next step.
+    """
+    stream = await _dispatch(proxy, module, qualname, lineno, function, *args, **kwargs)
+    try:
+        sent = None
+        result = await stream.__anext__()
+        while True:
+            try:
+                sent = yield result
+            except GeneratorExit:
+                await stream.aclose()
+                return
+            except BaseException as exc:
+                result = await stream.athrow(exc)
+            else:
+                if sent is None:
+                    result = await stream.__anext__()
+                else:
+                    result = await stream.asend(sent)
+    except StopAsyncIteration:
+        return
+    finally:
+        await stream.aclose()
 
 
 def _dispatch(
@@ -324,6 +495,8 @@ def _dispatch(
 
 
 async def _stream(fn, *args, **kwargs):
+    # The per-step `do_dispatch` scoping is what distinguishes this
+    # relay from the other two — see `_dispatch_stream`.
     gen = fn(*args, **kwargs)
     try:
         sent = None
