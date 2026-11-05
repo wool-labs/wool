@@ -178,7 +178,7 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
     # Arrange, act, & assert
     async def body():
         async with asyncio.timeout(_INTEGRATION_TIMEOUT):
-            async with build_pool_from_scenario(scenario, credentials_map):
+            async with build_pool_from_scenario(scenario, credentials_map) as pool:
                 # Each invocation runs in an isolated stdlib Context
                 # copy. pytest-asyncio re-uses a single ``context=``
                 # across every test invocation, so mutations made
@@ -189,7 +189,9 @@ async def test_dispatch_pairwise(scenario, credentials_map, retry_grpc_internal)
                 # between pytest runners, ``asyncio.Task(context=)``
                 # and ContextVar mutation visibility.
                 isolated = contextvars.copy_context()
-                await asyncio.create_task(invoke_routine(scenario), context=isolated)
+                await asyncio.create_task(
+                    invoke_routine(scenario, pool=pool), context=isolated
+                )
 
     await retry_grpc_internal(body)
 
@@ -274,12 +276,14 @@ async def test_dispatch_hypothesis(scenario, credentials_map, retry_grpc_interna
     # Arrange, act, & assert
     async def body():
         async with asyncio.timeout(_HYPOTHESIS_TIMEOUT):
-            async with build_pool_from_scenario(scenario, credentials_map):
+            async with build_pool_from_scenario(scenario, credentials_map) as pool:
                 # See ``test_dispatch_pairwise`` above for the
                 # rationale behind isolating each Hypothesis example
                 # in its own stdlib Context copy.
                 isolated = contextvars.copy_context()
-                await asyncio.create_task(invoke_routine(scenario), context=isolated)
+                await asyncio.create_task(
+                    invoke_routine(scenario, pool=pool), context=isolated
+                )
 
     await retry_grpc_internal(body)
 
