@@ -26,162 +26,128 @@ C = TypeVar("C", bound=Callable[..., Coroutine | AsyncGenerator])
 
 # public
 def routine(fn: C) -> C:
-    """Decorator to declare an asynchronous function as remotely executable.
+    """Convert an async function into a routine a worker pool executes.
 
-    Converts an asynchronous coroutine or generator into a distributed
-    task that can be executed by a worker pool. When the decorated function
-    is invoked, it is dispatched to the worker pool associated with the
-    current worker pool session context.
+    A routine is dispatched rather than called. Invocation resolves the
+    `WorkerProxy` ambient in the caller's context and ships the callable,
+    its arguments, and the caller's Wool chain to a worker that pool
+    selects; the body runs in the worker's process and its outcome
+    streams back. `wool.WorkerPool.dispatch` names a pool explicitly for
+    one call instead of reading it from context.
+
+    The call site is unchanged by the decorator. A coroutine routine is
+    awaited, an async generator routine is iterated, and both cancel
+    through the same mechanisms as their undecorated counterparts.
+
+    **Guarantees.** Cancellation crosses the boundary: cancelling the
+    awaiting task cancels the routine on the worker, as does ``aclose()``
+    or an abandoned iteration on an async generator. An unhandled
+    exception raised in the routine body is re-raised at the call site.
+
+    **Constraints.** The boundary is a process boundary crossed by
+    pickle, which bounds what a routine may accept, return, and yield,
+    and what it may assume about where it runs.
+
+    1. **Serializability.** Arguments, return values, and yielded values
+       are pickled. Open file handles, live connections, and lambdas are
+       not picklable; a custom type crosses only if it is, which may
+       require ``__getstate__`` and ``__setstate__``.
+    2. **Process affinity.** Successive invocations are not guaranteed to
+       land on the same worker, so `asyncio` synchronization primitives
+       do not compose across them and in-process global state does not
+       persist between them. A routine that is stateless and idempotent
+       is therefore also safely retryable. Synchronization that must hold
+       across invocations needs a file-based or otherwise distributed
+       primitive.
+    3. **Payload cost.** Every argument, return value, and yielded value
+       pays serialization and transport proportional to its size. A large
+       dataset costs less as a reference the worker resolves, e.g., a
+       path, a key, or a shared-memory handle, than as a value shipped
+       per call.
+
+    **Descriptor ordering.** The decorator operates on a raw function and
+    cannot unwrap a descriptor, so on a ``classmethod`` or
+    ``staticmethod`` it must be applied innermost, beneath the descriptor
+    decorator. The reverse order raises `ValueError`.
+
+    **Async generators.** An async generator routine streams pull-based:
+    the worker suspends at each ``yield`` until the consumer requests the
+    next value, so it buffers nothing on the routine's behalf and an
+    unbounded sequence costs what the consumer draws from it. The whole
+    protocol crosses the boundary: ``anext()``, ``asend()``, ``athrow()``
+    and ``aclose()`` each act on the remote generator.
+
+    **Resource release.** A completed dispatch releases its transport
+    resources before control returns to the caller: on the ``await`` for
+    a coroutine routine, on exhaustion or ``aclose()`` for an async
+    generator. Release is never deferred to garbage collection or to the
+    event loop's async-generator finalizer, so a routine awaited on a
+    loop that stops immediately afterwards strands nothing on that loop.
+
+    **Chain propagation.** A routine runs on the worker under the
+    caller's Wool chain: the caller's `wool.ContextVar` manifest is
+    decoded from the dispatch frame, the body runs under it, and the
+    mutations the body makes ship back on the response. Wool classifies
+    this propagation as *ancillary state*, distinct from the routine's
+    *primary signal* — its return value, or the exception it raised — and
+    that distinction decides what a failure to decode the manifest costs,
+    e.g., under cross-version pickle skew on one variable's value.
+
+    Under the default warning filter the primary signal survives. A
+    result is still returned and a routine exception is still raised with
+    its class intact, while each failed entry emits a
+    `wool.SerializationWarning` on the side that observed it, so the
+    failures stay visible in the Python warnings stream without
+    displacing the outcome.
+
+    Promoting that warning makes ancillary failures fatal::
+
+        import warnings
+        import wool
+
+        warnings.filterwarnings("error", category=wool.SerializationWarning)
+
+    The decode then aggregates its per-entry warnings into a single
+    `wool.ChainSerializationError`, a `wool.WoolError` subclass catchable
+    as `wool.SerializationError` and carrying the warnings on
+    `~wool.ChainSerializationError.warnings`. The frame kind decides
+    where it surfaces.
+
+    - **Result frames** lose the return value. The
+      `wool.ChainSerializationError` raises in place of the primary
+      signal, which is what lets the caller observe every bad entry
+      rather than only the first.
+    - **Exception frames** keep the routine exception as the primary
+      signal and attach the `wool.ChainSerializationError` to it as
+      ``__cause__``. The routine exception's class is preserved, so
+      ``except RoutineError:`` matches as written and no ``except*``
+      migration is required.
+
+    A caller that wants the result and the failure record both should
+    capture the warnings with ``warnings.catch_warnings(record=True)``
+    rather than promote them globally.
+
+    Strict mode applies symmetrically on the worker through the standard
+    ``PYTHONWARNINGS`` variable, which ``multiprocessing`` propagates to
+    spawned workers by default::
+
+        PYTHONWARNINGS = "error::wool.SerializationWarning"
+
+    A worker that promotes the warning ships the resulting
+    `wool.ChainSerializationError` back through the routine-exception
+    channel, so the caller catches the class it would have caught locally
+    and has no `grpc.aio.AioRpcError` to special-case.
 
     :param fn:
-        The asynchronous function or async generator to convert into a
-        distributed routine.
+        The coroutine function or async generator function to convert.
     :returns:
-        The decorated function that dispatches to the worker pool when
-        called.
+        A wrapper carrying ``fn``'s signature that dispatches the call
+        rather than executing it in the caller's process.
     :raises ValueError:
-        If the decorated function is a ``classmethod`` or
-        ``staticmethod`` descriptor (apply ``@wool.routine`` before
-        the descriptor decorator), or if the decorated function is
-        not a coroutine function or async generator function.
+        If ``fn`` is a ``classmethod`` or ``staticmethod`` descriptor, or
+        is neither a coroutine function nor an async generator function.
 
-    .. note::
-        Decorated functions behave like regular coroutines or async
-        generators and can be awaited, iterated over, and cancelled
-        normally. Task execution occurs transparently across the
-        distributed worker pool.
-
-    .. note::
-        When using ``@wool.routine`` on a ``@classmethod`` or
-        ``@staticmethod``, apply ``@wool.routine`` first (innermost)
-        and the descriptor decorator second (outermost). The routine
-        decorator operates on the raw function and cannot unwrap
-        descriptor objects.
-
-        .. code-block:: python
-
-            class MyService:
-                @classmethod
-                @wool.routine
-                async def fetch(cls, key: str) -> bytes: ...
-
-                @staticmethod
-                @wool.routine
-                async def ping() -> bool: ...
-
-    **Async Generator Support:**
-
-    For async generators, the decorator supports pull-based streaming
-    where the worker pauses at each ``yield`` until the client requests
-    the next value. This enables efficient processing of large or
-    infinite sequences without server-side buffering.
-
-    - **Supported operations**:
-      ``anext()``, ``asend()``, ``athrow()``, ``aclose()``
-    - **Cleanup**:
-      Calling ``aclose()`` or breaking out of iteration properly cancels
-      the remote worker task
-
-    **Dispatch cleanup:**
-
-    A completed dispatch releases its transport resources before control
-    returns to the caller — for a coroutine routine when the ``await``
-    returns, for an async generator on exhaustion or ``aclose()``.
-    Release is never deferred to garbage collection, so a routine
-    awaited on a loop that stops immediately afterwards strands nothing
-    on that loop.
-
-    Best practices and considerations for designing tasks:
-
-    1. **Picklability**: Arguments, return values, and yielded values
-       must be picklable for serialization between processes. Avoid
-       unpicklable objects like open file handles, database connections,
-       or lambda functions. Custom objects should implement
-       ``__getstate__`` and ``__setstate__`` methods if needed.
-
-    2. **Synchronization**: Tasks are not guaranteed to execute on the
-       same process between invocations. Standard :mod:`asyncio`
-       synchronization primitives will not work across processes.
-       Use file-based or other distributed synchronization utilities.
-
-    3. **Statelessness**: Design tasks to be stateless and idempotent.
-       Avoid global variables or shared mutable state to ensure
-       predictable behavior and enable safe retries.
-
-    4. **Cancellation**: Task cancellation behaves like standard Python
-       coroutine cancellation and is properly propagated across the
-       distributed system. For async generators, cancellation or calling
-       ``aclose()`` triggers proper cleanup.
-
-    5. **Error propagation**: Unhandled exceptions raised within tasks are
-       transparently propagated to the caller as they would be normally.
-
-    6. **Performance**: Minimize argument, return value, and yielded value
-       sizes to reduce serialization overhead. For large datasets,
-       consider using shared memory or passing references instead of the
-       data itself.
-
-    **Chain propagation and decode-failure semantics:**
-
-    Routines run on the worker under the caller's Wool chain: the
-    caller's :class:`wool.ContextVar` chain manifest is decoded from the
-    dispatch frame and the routine runs under it, with post-run
-    mutations shipped back on the response. Wool treats this
-    propagation as **ancillary state** — separate from the routine's
-    primary signal (its return value or raised exception):
-
-    - **Primary signal preservation.** A failure to decode the chain
-      manifest (e.g., cross-version pickle skew on a single
-      variable value) never preempts the routine's outcome. The
-      result is still returned; a routine exception is still raised.
-    - **Visibility via warning.** Every ancillary decode failure emits
-      a :class:`wool.SerializationWarning` on the side that observed
-      the failure. Under the default warning filter the routine
-      exception's type is preserved — ``except RoutineError:`` still
-      matches as written — and the warnings remain visible in the
-      Python warnings stream.
-    - **Strict mode (opt-in).** Promote the warning to an exception
-      to treat ancillary failures as fatal::
-
-          import warnings
-          import wool
-
-          warnings.filterwarnings("error", category=wool.SerializationWarning)
-
-      In strict mode the chain-manifest decode aggregates the per-entry
-      warnings into a single :class:`wool.ChainSerializationError` (a
-      :class:`wool.WoolError` subclass, catchable via
-      :class:`wool.SerializationError`, with the warnings on
-      :attr:`~wool.ChainSerializationError.warnings`):
-
-      * **Result frames** lose the routine's return value — the
-        :class:`~wool.ChainSerializationError` raises in place of the
-        primary signal so the caller observes every bad entry, not
-        just the first.
-      * **Exception frames** still preserve the routine exception as
-        the primary signal; the :class:`~wool.ChainSerializationError`
-        rides on it as ``__cause__`` via ``raise routine_exc from
-        decode_err``. The routine exception's class is preserved so
-        ``except RoutineError:`` keeps matching — no migration to
-        ``except*`` required.
-
-      Callers that want both result preservation *and* failure
-      visibility should instead use ``warnings.catch_warnings(record=True)``
-      to capture warnings without globally promoting them.
-
-      Strict mode applies symmetrically on the worker side via the
-      standard ``PYTHONWARNINGS`` environment variable, which
-      ``multiprocessing`` propagates to spawned worker subprocesses
-      by default::
-
-          PYTHONWARNINGS = "error::wool.SerializationWarning"
-
-      When the worker promotes the warning, wool ships the resulting
-      :class:`wool.ChainSerializationError` back through the
-      routine-exception channel so the caller catches the same error
-      class — no :class:`grpc.aio.AioRpcError` to special-case.
-
-    Example usage with coroutines:
+    A coroutine routine, dispatched by awaiting it:
 
     .. code-block:: python
 
@@ -202,7 +168,7 @@ def routine(fn: C) -> C:
             async with wool.WorkerPool():
                 print(await fibonacci(10))  # 34
 
-    Example usage with async generators:
+    An async generator routine, dispatched on first iteration:
 
     .. code-block:: python
 
@@ -222,34 +188,49 @@ def routine(fn: C) -> C:
                 async for value in fibonacci_series(10):
                     print(value)  # 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
 
+    Routines on a class, with the descriptor ordering applied:
+
+    .. code-block:: python
+
+        class MyService:
+            @classmethod
+            @wool.routine
+            async def fetch(cls, key: str) -> bytes: ...
+
+            @staticmethod
+            @wool.routine
+            async def ping() -> bool: ...
+
     .. rubric:: Implementation notes
 
-    The returned wrapper carries a ``__wool_dispatch__`` attribute
-    holding ``(entrypoint, lineno)``, where the entrypoint is the
-    dispatch function matching this routine's call shape — one
-    returning a coroutine, or one returning an async generator. It is
-    the pair `dispatch_through` needs to route this routine through a
-    proxy its caller names rather than the ambient one. Nothing in the
-    ambient dispatch path consults it; a routine call routes on the
-    `~wool.runtime.routine.task.do_dispatch` flag. Its absence is also
-    what marks a callable as undispatchable, which an explicit dispatch
-    needs because it is handed a callable rather than invoking one: an
-    undecorated coroutine function is callable and awaitable, so
-    without the attribute it would run in the caller's own process
-    while the call reported a dispatch.
+    The wrapper carries a ``__wool_dispatch__`` attribute holding
+    ``(entrypoint, lineno)``. The entrypoint is the dispatch function
+    matching the routine's call shape, one returning a coroutine or one
+    returning an async generator; ``lineno`` is the routine's source line,
+    which `_dispatch` folds into the task tag. `dispatch_through` needs
+    the pair to route a call through a proxy its caller names rather than
+    the ambient one, and reads it off the callable because it is handed
+    the callable rather than invoking it. The ambient path consults
+    neither member; a routine call routes on the
+    `~wool.runtime.routine.task.do_dispatch` flag.
 
-    A tuple rather than a bound hook. The attribute travels in the
-    wrapper's ``__dict__``, which cloudpickle ships for the shapes that
-    serialize by value (a closure, a ``classmethod``'s function), and a
-    closure over the wrapper would carry its own code object into every
-    such dispatch. Both members pickle to almost nothing: the
-    entrypoint is importable and ``lineno`` is an ``int``. The shapes
-    that serialize by reference carry no ``__dict__`` at all, so they
-    pay nothing either way.
+    The attribute's absence is what marks a callable undispatchable. An
+    undecorated coroutine function is callable and awaitable, so an
+    explicit dispatch that accepted one would run it in the caller's own
+    process while reporting a dispatch.
 
-    A bound ``classmethod`` or ``staticmethod`` forwards attribute
-    lookup to the underlying function, so the decorator ordering
-    documented above carries the attribute through.
+    The spec is a tuple in the wrapper's ``__dict__`` rather than a
+    closure over the wrapper, because cloudpickle ships that ``__dict__``
+    for every shape that serializes by value, e.g., a closure or a
+    ``classmethod``'s underlying function, and a closure over the wrapper
+    would carry its own code object into each such dispatch. Both members
+    cost almost nothing to pickle: the entrypoint is importable and
+    ``lineno`` is an ``int``. Shapes that serialize by reference carry no
+    ``__dict__`` at all, so they pay nothing either way.
+
+    A bound ``classmethod`` or ``staticmethod`` forwards attribute lookup
+    to the underlying function, which is what carries the attribute
+    through the descriptor ordering documented above.
     """
     if isinstance(fn, (classmethod, staticmethod)):
         raise ValueError(
