@@ -51,7 +51,7 @@ asyncio.run(main())
 
 ## Routines
 
-A Wool routine is an async function decorated with `@wool.routine`. When called, the function is serialized and dispatched to a worker in the pool, with the result streamed back to the caller. Invocation is transparent — you call a routine like any async function, with no special method required. For coroutines, `routine(args)` returns a coroutine and dispatch occurs on `await`. For async generators, `routine(args)` returns an async generator and dispatch occurs on first iteration.
+A Wool routine is an async function decorated with `@wool.routine`. When called, the function is serialized and dispatched to a worker in the pool, with the result streamed back to the caller. Invocation is transparent — you call a routine like any async function, with no special method required, and the call dispatches through whichever pool is active in the caller's context. To route one call through a specific pool instead, see [Explicit dispatch](#explicit-dispatch). For coroutines, `routine(args)` returns a coroutine and dispatch occurs on `await`. For async generators, `routine(args)` returns an async generator and dispatch occurs on first iteration.
 
 ```python
 @wool.routine
@@ -304,6 +304,24 @@ async with wool.WorkerPool(discovery=wool.LanDiscovery(), lease=10):
 async with wool.WorkerPool(spawn=4, lazy=False):
     result = await my_routine()
 ```
+
+### Explicit dispatch
+
+`WorkerPool.dispatch(routine, *args, **kwargs)` routes one call through *that* pool, whatever pool is active in the caller's context. It is the explicit single-dispatch primitive — one routine to one worker, selected by the pool's load balancer — and is otherwise indistinguishable from calling the routine directly: the return value has the routine's own shape, so a coroutine routine is awaited and an async generator routine is iterated, with `asend`, `athrow`, and `aclose` all behaving as they do on an ambient call.
+
+```python
+async with wool.WorkerPool(spawn=4) as gpu:
+    async with wool.WorkerPool(spawn=16):
+        # Routes through `gpu`, not the inner pool.
+        result = await gpu.dispatch(train, dataset)
+
+        # A plain call still routes through the inner pool.
+        summary = await summarize(result)
+```
+
+The override reaches the routine's nested calls too: the task carries the pool's proxy, so a `@wool.routine` the worker calls in turn routes through the same pool rather than the caller's.
+
+`routine` is positional-only and no keyword is reserved, so every argument reaches the routine — including one named `pool` or `routine`. The method raises `TypeError` for a callable that is not `@wool.routine`-decorated, since an undecorated callable would run in the caller's own process, and `RuntimeError` outside the pool's context, where no proxy is prepared.
 
 ## Workers
 
