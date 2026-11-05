@@ -450,6 +450,7 @@ class WorkerPool:
     """
 
     _workers: Final[dict[WorkerLike, Coroutine]]
+    _proxy: WorkerProxy | None
 
     @overload
     def __init__(
@@ -787,8 +788,8 @@ class WorkerPool:
                                 quorum=quorum,
                                 quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
-                            ):
-                                yield
+                            ) as proxy:
+                                yield proxy
 
             case (spawn, None) if spawn is not None:
                 if lease is not None:
@@ -820,8 +821,8 @@ class WorkerPool:
                                 quorum=quorum,
                                 quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
-                            ):
-                                yield
+                            ) as proxy:
+                                yield proxy
 
             case (None, discovery) if discovery is not None:
                 if lease is not None and lease == 0:
@@ -854,8 +855,8 @@ class WorkerPool:
                             quorum=quorum,
                             quorum_timeout=quorum_timeout,
                             lazy=self._lazy,
-                        ):
-                            yield
+                        ) as proxy:
+                            yield proxy
 
             case (None, None):
                 if lease is not None:
@@ -887,13 +888,14 @@ class WorkerPool:
                                 quorum=quorum,
                                 quorum_timeout=quorum_timeout,
                                 lazy=self._lazy,
-                            ):
-                                yield
+                            ) as proxy:
+                                yield proxy
 
             case _:
                 raise RuntimeError
 
         self._proxy_factory = create_proxy
+        self._proxy = None
 
     @staticmethod
     def _validate_quorum(quorum: int | None, max_workers: int | None) -> None:
@@ -926,12 +928,15 @@ class WorkerPool:
         """
         install_task_factory()
         self._proxy_context = self._proxy_factory()
-        await self._proxy_context.__aenter__()
+        self._proxy = await self._proxy_context.__aenter__()
         return self
 
     async def __aexit__(self, *args):
         """Stop all workers and tear down the pool and its services."""
-        await self._proxy_context.__aexit__(*args)
+        try:
+            await self._proxy_context.__aexit__(*args)
+        finally:
+            self._proxy = None
 
     @asynccontextmanager
     async def _worker_context(
