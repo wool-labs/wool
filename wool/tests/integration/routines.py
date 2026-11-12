@@ -645,6 +645,16 @@ async def nested_cancellable_sleep(sentinel_path: str, duration: float = 30.0):
 
 
 @wool.routine
+async def echo_colliding_names(*, pool=None, routine=None):
+    """Coroutine whose parameters collide with ``dispatch``'s own names.
+
+    `wool.WorkerPool.dispatch` reserves no keyword, so both values
+    reach this routine unshadowed.
+    """
+    return pool, routine
+
+
+@wool.routine
 async def get_pid() -> int:
     """Coroutine that returns the worker process id.
 

@@ -186,6 +186,12 @@ class RoutineShape(Enum):
     NESTED_COROUTINE = auto()
     NESTED_ASYNC_GEN = auto()
     NESTED_ASYNC_GEN_READBACK = auto()
+    # Dispatched through `WorkerPool.dispatch` rather than by calling
+    # the routine, so the pool is named by the receiver instead of read
+    # from the caller's context. Like the NESTED_* members these name a
+    # dispatch path rather than a callable shape.
+    EXPLICIT_COROUTINE = auto()
+    EXPLICIT_ASYNC_GEN = auto()
 
 
 class PoolMode(Enum):
@@ -1070,10 +1076,63 @@ def _cleanup_caller_vars(tokens):
         _CALLER_VARS[var_name].reset(token)
 
 
-async def invoke_routine(scenario):
-    """Invoke the appropriate routine for the given scenario and return results."""
+async def _drive_async_gen(gen, patterns):
+    """Consume ``gen`` and return its frames, honouring the var patterns.
+
+    Shared by the ambient and explicit generator shapes, which differ in
+    how the generator is obtained rather than in how it is driven.
+    """
+    collected = []
+    forward = {
+        k: v for k, v in patterns.items() if v is ContextVarPattern.MID_STREAM_FORWARD
+    }
+    # MID_STREAM_FORWARD drives the generator one step at a time,
+    # mutating the var to a per-step value before each ``__anext__`` so
+    # the worker frame observes the forward-propagated value.
+    if forward:
+        step = 0
+        while True:
+            for var_name in forward:
+                _CALLER_VARS[var_name].set(f"step-{step}")
+            try:
+                item = await gen.__anext__()
+            except StopAsyncIteration:
+                break
+            collected.append(item)
+            step += 1
+        return collected
+    step = 0
+    async for item in gen:
+        collected.append(item)
+        if patterns:
+            per_yield = {
+                k: v for k, v in patterns.items() if v is ContextVarPattern.PER_YIELD
+            }
+            for var_name in per_yield:
+                var = _CALLER_VARS[var_name]
+                assert var.get() == f"step-{step}", (
+                    f"PER_YIELD step {step}: expected 'step-{step}', got {var.get()!r}"
+                )
+        step += 1
+    return collected
+
+
+async def invoke_routine(scenario, pool=None):
+    """Invoke the appropriate routine for the given scenario and return results.
+
+    :param pool:
+        The entered pool the builder yielded. Required by the
+        ``EXPLICIT_*`` shapes, which name their pool by the receiver
+        instead of reading it from the caller's context; the ambient
+        shapes ignore it.
+    """
     binding = scenario.binding
     shape = scenario.shape
+    if shape in _EXPLICIT_SHAPES and pool is None:
+        raise ValueError(
+            f"{shape.name} dispatches through a named pool, so invoke_routine "
+            "needs the pool the builder yielded; pass pool=..."
+        )
 
     patterns = _build_patterns_dict(scenario)
 
@@ -1107,51 +1166,32 @@ async def invoke_routine(scenario):
                 return result
 
             case RoutineShape.ASYNC_GEN_ANEXT:
-                collected = []
                 if binding is RoutineBinding.INSTANCE_METHOD:
                     gen = routine(obj, 3)
                 else:
                     gen = routine(3)
-                forward = {
-                    k: v
-                    for k, v in patterns.items()
-                    if v is ContextVarPattern.MID_STREAM_FORWARD
-                }
-                # MID_STREAM_FORWARD drives the generator one step at a
-                # time, mutating the var to a per-step value before
-                # each ``__anext__`` so the worker frame observes the
-                # forward-propagated value.
-                if forward:
-                    step = 0
-                    while True:
-                        for var_name in forward:
-                            _CALLER_VARS[var_name].set(f"step-{step}")
-                        try:
-                            item = await gen.__anext__()
-                        except StopAsyncIteration:
-                            break
-                        collected.append(item)
-                        step += 1
-                    assert collected == [0, 1, 2]
-                    if patterns:
-                        _assert_caller_vars(patterns, initial_values, shape=shape)
-                    return collected
-                step = 0
-                async for item in gen:
-                    collected.append(item)
-                    if patterns:
-                        per_yield = {
-                            k: v
-                            for k, v in patterns.items()
-                            if v is ContextVarPattern.PER_YIELD
-                        }
-                        for var_name in per_yield:
-                            var = _CALLER_VARS[var_name]
-                            assert var.get() == f"step-{step}", (
-                                f"PER_YIELD step {step}: expected "
-                                f"'step-{step}', got {var.get()!r}"
-                            )
-                    step += 1
+                collected = await _drive_async_gen(gen, patterns)
+                assert collected == [0, 1, 2]
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return collected
+
+            case RoutineShape.EXPLICIT_COROUTINE:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    result = await pool.dispatch(routine, obj, 1, 2)
+                else:
+                    result = await pool.dispatch(routine, 1, 2)
+                assert result == 3
+                if patterns:
+                    _assert_caller_vars(patterns, initial_values, shape=shape)
+                return result
+
+            case RoutineShape.EXPLICIT_ASYNC_GEN:
+                if binding is RoutineBinding.INSTANCE_METHOD:
+                    gen = pool.dispatch(routine, obj, 3)
+                else:
+                    gen = pool.dispatch(routine, 3)
+                collected = await _drive_async_gen(gen, patterns)
                 assert collected == [0, 1, 2]
                 if patterns:
                     _assert_caller_vars(patterns, initial_values, shape=shape)
@@ -1304,6 +1344,14 @@ def _select_routine(shape, binding):
         case (RoutineShape.ASYNC_GEN_ACLOSE, _):
             return routines.closeable_gen
 
+        # The explicit shapes differ from their ambient counterparts in
+        # how ``invoke_routine`` dispatches them, not in what they
+        # dispatch, so they resolve to the same routines.
+        case (RoutineShape.EXPLICIT_COROUTINE, _):
+            return _select_routine(RoutineShape.COROUTINE, binding)
+        case (RoutineShape.EXPLICIT_ASYNC_GEN, _):
+            return _select_routine(RoutineShape.ASYNC_GEN_ANEXT, binding)
+
         case (RoutineShape.NESTED_COROUTINE, _):
             return routines.nested_add
         case (RoutineShape.NESTED_ASYNC_GEN, _):
@@ -1333,6 +1381,15 @@ _ASYNC_GEN_SHAPES = (
     RoutineShape.ASYNC_GEN_ACLOSE,
     RoutineShape.NESTED_ASYNC_GEN,
     RoutineShape.NESTED_ASYNC_GEN_READBACK,
+    RoutineShape.EXPLICIT_ASYNC_GEN,
+)
+# These shapes hand ``invoke_routine`` the *unbound* wrapper with the
+# receiver as an ordinary argument, as the ambient shapes do, so they do
+# not exercise dispatching an already-bound method. That idiom is
+# covered in ``test_explicit_dispatch.py`` and the pool unit suite.
+_EXPLICIT_SHAPES = (
+    RoutineShape.EXPLICIT_COROUTINE,
+    RoutineShape.EXPLICIT_ASYNC_GEN,
 )
 _NESTED_ONLY_PATTERNS = (
     ContextVarPattern.DOWNSTREAM_OVERWRITE,
