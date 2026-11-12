@@ -7,6 +7,7 @@ subprocess overhead and ensure deterministic behavior.
 
 import asyncio
 import functools
+import inspect
 import logging
 import os
 import time
@@ -53,6 +54,78 @@ _HANG = object()
 
 class _BrokenPublisherError(Exception):
     """A publisher failure of a type the pool has never heard of."""
+
+
+@wool.routine
+async def _routine(a=0, b=0):
+    """Return the sum of two arguments."""
+    return a + b
+
+
+@wool.routine
+async def _colliding_routine(*, pool=None, routine=None):
+    """Return the two keywords that collide with ``dispatch``'s own names."""
+    return pool, routine
+
+
+@wool.routine
+async def _streaming_routine(n=0):
+    """Yield the integers below ``n``."""
+    for i in range(n):
+        yield i
+
+
+class _RoutineHost:
+    """Carry the bound routine shapes an explicit dispatch must accept."""
+
+    @wool.routine
+    async def instance_add(self, a=0, b=0):
+        """Return the sum of two arguments, bound to an instance."""
+        return a + b
+
+    @classmethod
+    @wool.routine
+    async def class_add(cls, a=0, b=0):
+        """Return the sum of two arguments, bound to the class."""
+        return a + b
+
+
+class _FrameStream:
+    """Stream fixed result frames without implementing ``asend``.
+
+    Mirrors the worker-side streams that drive `wool.routine`'s own
+    relay in ``tests/runtime/routine/test_wrapper.py``: a dispatch
+    relay that reached for ``asend`` rather than ``__anext__`` to take
+    an unsent frame would fail against this with ``AttributeError``.
+    """
+
+    def __init__(self, *frames):
+        self._frames = list(frames)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._frames:
+            raise StopAsyncIteration
+        return self._frames.pop(0)
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _arm_dispatch(mocker: MockerFixture, proxy, *frames) -> _FrameStream:
+    """Make ``proxy.dispatch`` resolve to a stream over ``frames``.
+
+    Assigns ``id`` as well: a dispatched task checks its proxy against
+    the protocol it needs, and that check reads attributes statically,
+    so a mock's dynamically conjured ones do not satisfy it.
+    """
+    stream = _FrameStream(*frames)
+    proxy.id = uuid.uuid4()
+    proxy.dispatch = mocker.AsyncMock(return_value=stream)
+    return stream
 
 
 def _make_worker_metadata(*tags: str) -> WorkerMetadata:
@@ -6011,3 +6084,328 @@ class TestWorkerPool:
 
         # Assert
         assert isinstance(pool, WorkerPool)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_route_through_the_pools_proxy(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test the pool dispatches through the proxy it prepared.
+
+        Given:
+            An entered WorkerPool whose proxy records its dispatches.
+        When:
+            A routine is dispatched through the pool with arguments.
+        Then:
+            It should build a task carrying the pool's own proxy, the
+            routine, and every argument.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 3)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            result = await pool.dispatch(_routine, 1, 2)
+
+        # Assert
+        mock_worker_proxy.dispatch.assert_called_once()
+        task = mock_worker_proxy.dispatch.call_args.args[0]
+        assert task.proxy is mock_worker_proxy
+        assert task.callable is _routine
+        assert task.args == (1, 2)
+        assert task.kwargs == {}
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_reserve_no_keyword_names(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test every keyword reaches the routine unshadowed.
+
+        Given:
+            An entered WorkerPool and a routine with parameters named
+            ``pool`` and ``routine``.
+        When:
+            Both are passed to the pool as keywords.
+        Then:
+            It should carry both to the task rather than consume either
+            as its own argument.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, ("p", "r"))
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            result = await pool.dispatch(_colliding_routine, pool="p", routine="r")
+
+        # Assert
+        task = mock_worker_proxy.dispatch.call_args.args[0]
+        assert task.args == ()
+        assert task.kwargs == {"pool": "p", "routine": "r"}
+        assert result == ("p", "r")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_return_a_coroutine_when_the_routine_is_one(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test a dispatched coroutine routine keeps its own shape.
+
+        Given:
+            An entered WorkerPool and a coroutine routine.
+        When:
+            The routine is dispatched through the pool.
+        Then:
+            It should return a coroutine resolving to the routine's
+            result.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 3)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            dispatched = pool.dispatch(_routine, 1, 2)
+
+            # Assert
+            assert inspect.iscoroutine(dispatched)
+            assert await dispatched == 3
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_return_a_stream_when_the_routine_is_a_generator(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test a dispatched async generator routine keeps its own shape.
+
+        Given:
+            An entered WorkerPool and an async generator routine.
+        When:
+            The routine is dispatched through the pool.
+        Then:
+            It should return an async generator yielding the routine's
+            frames.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 0, 1, 2)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            dispatched = pool.dispatch(_streaming_routine, 3)
+
+            # Assert
+            assert inspect.isasyncgen(dispatched)
+            assert [frame async for frame in dispatched] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_dispatch_nothing_until_the_result_is_consumed(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test dispatching is as lazy as calling the routine.
+
+        Given:
+            An entered WorkerPool, a coroutine routine, and an async
+            generator routine.
+        When:
+            Both are dispatched but neither result is consumed.
+        Then:
+            It should not have reached the proxy yet.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 3)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            coroutine = pool.dispatch(_routine, 1, 2)
+            stream = pool.dispatch(_streaming_routine, 3)
+
+            # Assert
+            mock_worker_proxy.dispatch.assert_not_called()
+            coroutine.close()
+            await stream.aclose()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_relay_a_stream_that_implements_no_asend(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test the dispatch relay takes unsent frames with __anext__.
+
+        Given:
+            An entered WorkerPool whose proxy streams results without
+            implementing ``asend``.
+        When:
+            A dispatched async generator is consumed without sending.
+        Then:
+            It should relay every frame and close the stream.
+        """
+        # Arrange
+        stream = _arm_dispatch(mocker, mock_worker_proxy, 0, 1, 2)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            collected = [frame async for frame in pool.dispatch(_streaming_routine, 3)]
+
+        # Assert
+        assert collected == [0, 1, 2]
+        assert stream.closed
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_deliver_every_argument_when_bound_to_an_instance(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test a bound method carries its receiver and its arguments.
+
+        Given:
+            An entered WorkerPool and a routine bound to an instance.
+        When:
+            The bound method is dispatched with its full argument list.
+        Then:
+            It should carry the receiver ahead of every argument, as
+            calling the routine does.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 3)
+        host = _RoutineHost()
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            result = await pool.dispatch(host.instance_add, 1, 2)
+
+        # Assert
+        task = mock_worker_proxy.dispatch.call_args.args[0]
+        assert task.callable is _RoutineHost.instance_add
+        assert task.args == (host, 1, 2)
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_deliver_every_argument_when_bound_to_a_class(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test a classmethod carries its class and its arguments.
+
+        Given:
+            An entered WorkerPool and a routine bound to a class.
+        When:
+            The classmethod is dispatched with its full argument list.
+        Then:
+            It should carry the class ahead of every argument, as
+            calling the routine does.
+        """
+        # Arrange
+        _arm_dispatch(mocker, mock_worker_proxy, 3)
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act
+            result = await pool.dispatch(_RoutineHost.class_add, 1, 2)
+
+        # Assert
+        task = mock_worker_proxy.dispatch.call_args.args[0]
+        assert task.args == (_RoutineHost, 1, 2)
+        assert result == 3
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_when_the_callable_is_undecorated(
+        self, mock_local_worker, mock_worker_proxy
+    ):
+        """Test an undecorated callable is refused.
+
+        Given:
+            An entered WorkerPool and a plain coroutine function.
+        When:
+            The plain function is dispatched.
+        Then:
+            It should raise TypeError rather than route a callable that
+            would run in the caller's own process.
+        """
+
+        # Arrange
+        async def undecorated():
+            return "local"
+
+        async with AsyncExitStack() as stack:
+            pool = await stack.enter_async_context(WorkerPool(spawn=1))
+
+            # Act & assert
+            with pytest.raises(TypeError, match="Expected a @wool.routine"):
+                pool.dispatch(undecorated)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_when_the_pool_is_not_entered(self):
+        """Test dispatching outside the pool's context is refused.
+
+        Given:
+            A WorkerPool that has not been entered.
+        When:
+            A routine is dispatched through the pool.
+        Then:
+            It should raise RuntimeError, because no proxy is prepared
+            outside the pool's context.
+        """
+        # Arrange
+        pool = WorkerPool(spawn=1)
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="WorkerPool is not entered"):
+            pool.dispatch(_routine)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_when_the_pool_context_has_exited(
+        self, mock_local_worker, mock_worker_proxy
+    ):
+        """Test the pool releases its proxy at context exit.
+
+        Given:
+            A WorkerPool whose context has been entered and exited.
+        When:
+            A routine is dispatched afterwards.
+        Then:
+            It should raise RuntimeError rather than route through the
+            proxy the exited context tore down.
+        """
+        # Arrange
+        pool = WorkerPool(spawn=1)
+        async with pool:
+            pass
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="WorkerPool is not entered"):
+            pool.dispatch(_routine)
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_raise_when_the_pool_context_exit_failed(
+        self, mocker: MockerFixture, mock_local_worker, mock_worker_proxy
+    ):
+        """Test the pool releases its proxy even when exit fails.
+
+        Given:
+            A WorkerPool whose context exit itself raised.
+        When:
+            A routine is dispatched afterwards.
+        Then:
+            It should raise RuntimeError, because the proxy is released
+            on every exit path rather than only the clean one.
+        """
+        # Arrange
+        mock_worker_proxy.__aexit__ = mocker.AsyncMock(
+            side_effect=RuntimeError("proxy teardown failed")
+        )
+        pool = WorkerPool(spawn=1)
+        with pytest.raises(RuntimeError, match="proxy teardown failed"):
+            async with pool:
+                pass
+
+        # Act & assert
+        with pytest.raises(RuntimeError, match="WorkerPool is not entered"):
+            pool.dispatch(_routine)
