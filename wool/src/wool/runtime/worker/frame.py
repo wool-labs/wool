@@ -553,6 +553,55 @@ class ExceptionResponseFrame(
         }
 
 
+def _rebuild_exception_with_safe_state(
+    serializer: Serializer, exc: BaseException
+) -> BaseException:
+    """Rebuild exception-valued arguments after their side state fails to pickle.
+
+    This is a last resort for structured fields such as ``cause`` and
+    ``original``. Intrinsically unpicklable non-exception arguments still
+    fail, leaving the caller to demote the error as usual.
+    """
+
+    restored: dict[int, BaseException] = {}
+    active: set[int] = set()
+
+    def restore_value(value: Any, depth: int) -> Any:
+        if isinstance(value, BaseException) and id(value) in restored:
+            return restored[id(value)]
+        try:
+            serializer.dumps(value)
+        except (pickle.PickleError, TypeError, AttributeError, RecursionError):
+            if not isinstance(value, BaseException) or depth == 0:
+                raise
+            return restore_exception(value, depth - 1)
+        return value
+
+    def restore_exception(error: BaseException, depth: int) -> BaseException:
+        identity = id(error)
+        if identity in active:
+            raise TypeError("cyclic exception constructor arguments")
+        active.add(identity)
+        try:
+            clean = type(error)(*(restore_value(arg, depth) for arg in error.args))
+        finally:
+            active.remove(identity)
+        # Register before restoring attributes so shared and cyclic references
+        # reuse one repaired object instead of expanding the graph repeatedly.
+        restored[identity] = clean
+        for name, value in error.__dict__.items():
+            try:
+                clean.__dict__[name] = restore_value(value, depth)
+            except Exception:
+                # Drop only the side state that still cannot travel. Fields
+                # restored by the constructor remain intact, including task
+                # representations and nested serialization-warning metadata.
+                pass
+        return clean
+
+    return restore_exception(exc, 64)
+
+
 def _safely_serialize_exception(
     serializer: Serializer,
     exc: BaseException,
@@ -590,11 +639,15 @@ def _safely_serialize_exception(
     a fresh ``cls(*exc.args)``; the wire-survival guarantee holds
     only on the primary path.
 
+    If a structured argument is itself an exception with unpicklable
+    attachments, a final reconstruction preserves its usable arguments
+    and attributes while dropping the failing side state. This repair is
+    depth-bounded. Non-exception arguments must remain picklable.
+
     If even ``cls(*exc.args)`` cannot be constructed or pickled
     (constructor side effects, unpicklable args), demote to a
     stdlib `RuntimeError` carrying the original class
-    name and message — always picklable, so the third ``dumps``
-    cannot fail.
+    name and message — an always-picklable final payload.
     """
     try:
         return serializer.dumps(exc)
@@ -680,9 +733,16 @@ def _safely_serialize_exception(
             clean.__cause__ = None
             clean.__context__ = None
             clean.__suppress_context__ = True
-            return serializer.dumps(clean)
+            try:
+                return serializer.dumps(clean)
+            except (pickle.PickleError, TypeError, AttributeError, RecursionError):
+                # A structured exception argument may itself carry the
+                # unpicklable attachment. Preserve its class and usable
+                # fields before considering the RuntimeError demotion.
+                rebuilt = _rebuild_exception_with_safe_state(serializer, exc)
+                return serializer.dumps(rebuilt)
     except Exception:
-        # Honor the docstring's "third dumps cannot fail" promise:
+        # Honor the docstring's always-picklable final-payload promise:
         # any reconstruction failure (over-eager ``__init__``
         # validation, custom ``__new__``, un-picklable args, etc.)
         # — not just the narrow pickle/type/recursion set — must

@@ -37,17 +37,24 @@ class SerializationError(WoolError):
         Optional ``repr()``-style preview of the value that failed to
         encode, for diagnostics when the cause exception's own message
         does not name the offending value.
+
+    ``args`` carries ``(message, cause, value_repr)`` so the worker can
+    reconstruct the structured fields with ``type(error)(*error.args)``.
+    ``str(error)`` renders only the message, as before.
     """
 
     def __init__(
         self,
-        *args: Any,
+        message: object = "",
         cause: BaseException | None = None,
         value_repr: str | None = None,
     ) -> None:
-        super().__init__(*args)
+        super().__init__(message, cause, value_repr)
         self.cause = cause
         self.value_repr = value_repr
+
+    def __str__(self) -> str:
+        return str(self.args[0])
 
 
 # public
@@ -69,15 +76,23 @@ class ChainSerializationError(SerializationError):
         order. They are kept on the `warnings` attribute; the
         exception's own message is a synthesized summary, so ``str()``
         reads as a count of failures rather than a tuple of warnings.
+        The warnings themselves are stored in ``args`` for reconstruction.
     """
 
     def __init__(self, *warnings: SerializationWarning) -> None:
         self.warnings: tuple[SerializationWarning, ...] = tuple(
             w for w in warnings if isinstance(w, SerializationWarning)
         )
+        # The aggregator's identity is its warnings rather than the atomic
+        # error's message/cause/value_repr tuple. Both reconstruct from args.
+        WoolError.__init__(self, *self.warnings)
+        self.cause = None
+        self.value_repr = None
+
+    def __str__(self) -> str:
         count = len(self.warnings)
         noun = "variable" if count == 1 else "variables"
-        super().__init__(f"{count} context {noun} failed to serialize across the wire")
+        return f"{count} context {noun} failed to serialize across the wire"
 
 
 # public
@@ -216,7 +231,6 @@ class ChainContention(WoolError):
 
     def __init__(
         self,
-        *,
         chain_id: UUID,
         kind: Literal["thread", "task", "create_task"],
         owning_thread: int | None = None,
@@ -236,14 +250,22 @@ class ChainContention(WoolError):
                 f"unknown ChainContention kind: {kind!r}; "
                 f"expected one of {sorted(_KIND_MESSAGES)}"
             )
-        message = _KIND_MESSAGES[kind].format(
-            chain_id=chain_id,
-            owning_thread=owning_thread,
-            current_thread=current_thread,
-            owning_task=owning_task,
-            current_task=current_task,
+        # Keep local task identities accessible on the attributes, but put
+        # only their diagnostic representations in the reconstructible args.
+        # Strings already received over the wire must not gain another repr.
+        owning_repr = (
+            repr(owning_task)
+            if owning_task is not None and not isinstance(owning_task, str)
+            else owning_task
         )
-        super().__init__(message)
+        current_repr = (
+            repr(current_task)
+            if current_task is not None and not isinstance(current_task, str)
+            else current_task
+        )
+        super().__init__(
+            chain_id, kind, owning_thread, current_thread, owning_repr, current_repr
+        )
         self.chain_id = chain_id
         self.kind = kind
         self.owning_thread = owning_thread
@@ -252,36 +274,17 @@ class ChainContention(WoolError):
         self.current_task = current_task
 
     def __reduce__(self) -> tuple[Any, ...]:
-        # ``ChainContention`` crosses the wire via
-        # `_safely_serialize_exception`. The default
-        # ``BaseException.__reduce__`` pickles ``(type, args)`` where
-        # ``args`` is the pre-formatted message — fine for the primary
-        # ``serializer.dumps`` path, but the type-preserving fallback
-        # rebuilds via ``cls(*exc.args)``, which our keyword-only
-        # constructor rejects. ``__reduce__`` returning the structured
-        # kwargs keeps both paths intact: the structured fields ride the
-        # wire and the message is re-composed by ``__init__`` on the
-        # receiver.
-        #
-        # ``owning_task``/``current_task`` hold live ``asyncio.Task``
-        # objects, which are unpicklable — left as-is a ``kind="task"``
-        # contention fails the primary ``dumps`` *and* the
-        # ``cls(*exc.args)`` fallback, demoting to a plain
-        # ``RuntimeError`` across the wire (wool-labs/wool#256). Substitute
-        # their ``repr`` so the structured identity rides the wire as
-        # diagnostic text; the message templates render a live ``Task``
-        # and its ``repr`` identically, so the reconstructed message is
-        # unchanged.
-        return (
-            _reconstruct_chain_contention,
-            (
-                self.chain_id,
-                self.kind,
-                self.owning_thread,
-                self.current_thread,
-                repr(self.owning_task) if self.owning_task is not None else None,
-                repr(self.current_task) if self.current_task is not None else None,
-            ),
+        # Skip __dict__, which retains live tasks locally. The structured
+        # args suffice for both normal pickling and the worker's fallback.
+        return type(self), self.args
+
+    def __str__(self) -> str:
+        return _KIND_MESSAGES[self.kind].format(
+            chain_id=self.chain_id,
+            owning_thread=self.owning_thread,
+            current_thread=self.current_thread,
+            owning_task=self.args[4],
+            current_task=self.args[5],
         )
 
 
@@ -293,7 +296,7 @@ def _reconstruct_chain_contention(
     owning_task: asyncio.Future[Any] | str | None,
     current_task: asyncio.Future[Any] | str | None,
 ) -> ChainContention:
-    """Module-level constructor for `ChainContention.__reduce__`."""
+    """Reconstruct payloads pickled before ChainContention used structured args."""
     return ChainContention(
         chain_id=chain_id,
         kind=kind,

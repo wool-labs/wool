@@ -77,8 +77,11 @@ class Rejected(Exception):
     """
 
     def __init__(self, original: Exception) -> None:
-        super().__init__(f"{type(original).__name__}: {original!s}")
+        super().__init__(original)
         self.original = original
+
+    def __str__(self) -> str:
+        return f"{type(self.original).__name__}: {self.original!s}"
 
 
 class DispatchSession:

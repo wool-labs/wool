@@ -170,14 +170,14 @@ class RpcError(Exception):
     ):
         self.code = code
         self.details = details
-        if code is not None and details is not None:
-            super().__init__(f"{code.name}: {details}")
-        elif code is not None:  # pragma: no cover
-            super().__init__(code.name)
-        elif details is not None:
-            super().__init__(details)
-        else:  # pragma: no cover
-            super().__init__()
+        super().__init__(code, details)
+
+    def __str__(self) -> str:
+        if self.code is not None and self.details is not None:
+            return f"{self.code.name}: {self.details}"
+        if self.code is not None:
+            return self.code.name
+        return self.details if self.details is not None else ""
 
 
 # public
