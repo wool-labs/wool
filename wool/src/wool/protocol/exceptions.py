@@ -21,4 +21,8 @@ class ProtobufImportError(ImportError):
     """
 
     def __init__(self, exception: ImportError):
-        super().__init__(f"{str(exception)} - ensure protocol buffers are compiled.")
+        super().__init__(exception)
+        self.msg = str(self)
+
+    def __str__(self) -> str:
+        return f"{self.args[0]} - ensure protocol buffers are compiled."

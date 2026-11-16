@@ -394,6 +394,34 @@ async with wool.WorkerPool(
 
 The table classifies dispatch-path failures, where the behavior column is the load balancer's response. The idle poll reaches no load balancer and adds one error of its own, `IdleUnavailable` — see [Idle reporting](#idle-reporting).
 
+### Exception reconstruction
+
+Wool exceptions carry their structured identity in `args`, so a worker can
+rebuild them as `type(error)(*error.args)` when incidental state cannot be
+pickled. Use `str(error)` for the rendered message rather than reading it
+from `args[0]`.
+
+| Exception | Reconstruction arguments |
+| --------- | ------------------------ |
+| `ChainContention` | Chain ID, kind, thread IDs, and task representations |
+| `RpcError` and its subclasses | Status code and details |
+| `SerializationError` | Message, cause, and value representation |
+| `ChainSerializationError` | The collected serialization warnings |
+| `Rejected` | The original exception |
+| `ProtobufImportError` | The underlying import error |
+
+`SerializationError` takes one message followed by optional `cause` and
+`value_repr` fields, which can also be supplied by keyword. Its former
+arbitrary positional message arguments are replaced by these structured
+slots. `ChainContention` retains live task identities locally; only its
+reconstruction arguments and received task fields use diagnostic strings.
+
+The serializer still emits `SerializationWarning` when fallback loses side
+state. Exception-valued fields with unpicklable attachments receive a
+bounded reconstruction that preserves their usable fields. Intrinsically
+unpicklable non-exception arguments can still demote the error to
+`RuntimeError`.
+
 ### Security filter
 
 Proxies enforce security compatibility during discovery. A proxy configured with credentials only connects to workers with `secure=True` metadata; a proxy without credentials only connects to `secure=False` workers. This prevents mixed security configurations within a pool.

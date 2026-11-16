@@ -28,7 +28,7 @@ class TestSerializationError:
             An instance is constructed with only a message argument.
         Then:
             It should expose None for cause and value_repr, and carry
-            the message on args.
+            the message and default structured fields on args.
         """
         # Act
         error = SerializationError("encode failed")
@@ -36,7 +36,7 @@ class TestSerializationError:
         # Assert
         assert error.cause is None
         assert error.value_repr is None
-        assert error.args == ("encode failed",)
+        assert error.args == ("encode failed", None, None)
 
     def test___init___should_expose_structured_fields_when_provided(self):
         """Test SerializationError construction with structured fields.
@@ -101,8 +101,7 @@ class TestChainSerializationError:
             A ChainSerializationError is constructed from them.
         Then:
             It should keep exactly the two warnings on the warnings
-            attribute and carry a synthesized summary message on args
-            instead of the raw arguments tuple.
+            attribute and on args, while str() renders the summary.
         """
         # Arrange
         warning_a = SerializationWarning("first failure")
@@ -113,7 +112,7 @@ class TestChainSerializationError:
 
         # Assert
         assert error.warnings == (warning_a, warning_b)
-        assert error.args == (str(error),)
+        assert error.args == (warning_a, warning_b)
         assert "plain" not in str(error)
 
     def test_warnings_should_return_empty_tuple_when_no_warning_args(self):
